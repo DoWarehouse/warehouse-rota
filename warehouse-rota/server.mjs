@@ -236,7 +236,7 @@ export function createRotaServer(options = {}) {
       dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
     }));
     return {
-      revision: revision(), week, demo, build: 'compact-history-20261003', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      revision: revision(), week, demo, build: 'compact-weekly-performance-20261003', departments: DEPARTMENTS, warehouses: WAREHOUSES,
       previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
       dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
       locations: db.prepare('SELECT id, name, share_token, active FROM locations ORDER BY active DESC, name COLLATE NOCASE').all(),
@@ -434,10 +434,20 @@ export function createRotaServer(options = {}) {
         }
         if (method === 'GET' && pathname === '/api/state') return send(res, 200, state(weekValue(url.searchParams.get('week') || monday())));
         if (method === 'GET' && /^\/api\/people\/[^/]+\/performance$/.test(pathname)) {
+          const colleague = person(pathname.split('/')[3]);
+          const requestedWeek = url.searchParams.get('week');
           const requestedDate = url.searchParams.get('date');
+          requireThat(!(requestedWeek && requestedDate), 'Choose a rota week or a single performance date.');
+          if (requestedWeek) {
+            const week = weekValue(requestedWeek);
+            const loc = location(url.searchParams.get('locationId') || colleague.location_id);
+            const shifts = db.prepare('SELECT person_id, date, start_time, end_time, kind FROM shifts WHERE person_id = ? AND location_id = ? AND date BETWEEN ? AND ? ORDER BY date, start_time').all(colleague.id, loc.id, week, addDays(week, 6));
+            try { return send(res, 200, await dashboard.weeklyProfile(colleague, shifts, week)); }
+            catch (error) { if (error instanceof Problem) throw error; throw new Problem(502, error.message); }
+          }
           const date = requestedDate ? dateValue(requestedDate) : '';
           requireThat(!date || date <= today(), 'Choose a performance date up to today.');
-          try { return send(res, 200, await dashboard.profile(person(pathname.split('/')[3]), date)); }
+          try { return send(res, 200, await dashboard.profile(colleague, date)); }
           catch (error) { if (error instanceof Problem) throw error; throw new Problem(502, error.message); }
         }
         if (method === 'GET' && pathname === '/api/export.pdf') return await sharePDF(res, location(url.searchParams.get('locationId')), url);
