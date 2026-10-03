@@ -475,6 +475,14 @@ export function createRotaServer(options = {}) {
           }
           if (method === 'POST' && pathname === '/api/people') return { id: savePerson(body) };
           if (method === 'PUT' && /^\/api\/people\/[^/]+$/.test(pathname)) return { id: savePerson(body, pathname.split('/').at(-1)) };
+          if (method === 'DELETE' && /^\/api\/people\/[^/]+$/.test(pathname)) {
+            const id = pathname.split('/').at(-1);
+            person(id);
+            requireThat(body.confirm === true, 'Confirm deletion of this colleague and their draft shifts.');
+            const removed = db.prepare('DELETE FROM shifts WHERE person_id = ?').run(id);
+            db.prepare('DELETE FROM people WHERE id = ?').run(id);
+            return { deleted: true, removed_shifts: Number(removed.changes) };
+          }
           if (method === 'POST' && pathname === '/api/people/import') {
             location(body.location_id);
             requireThat(Array.isArray(body.people) && body.people.length > 0 && body.people.length <= 1000, 'Import between 1 and 1,000 colleagues.');
