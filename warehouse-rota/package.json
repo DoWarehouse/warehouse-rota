@@ -1,0 +1,20 @@
+{
+  "name": "warehouse-rota",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A warehouse rota with bulk scheduling and a shared read-only QR view.",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "demo": "node scripts/preview.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check server.mjs && node --check public/app.js"
+  },
+  "dependencies": {
+    "pdfkit": "0.17.2",
+    "qrcode": "1.5.4"
+  }
+}

@@ -1,0 +1,24 @@
+# Do not deploy until you have reviewed the app.
+# The paid service and persistent disk preserve rota data across updates.
+services:
+  - type: web
+    name: dylan-oaks-warehouse-rota
+    runtime: node
+    region: frankfurt
+    plan: 0.5c-512mb
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: 24.19.0
+      - key: DATA_DIR
+        value: /var/data
+      - key: ADMIN_PASSWORD
+        sync: false
+    disk:
+      name: rota-data
+      mountPath: /var/data
+      sizeGB: 1
