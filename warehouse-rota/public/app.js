@@ -48,14 +48,15 @@ function stored(key, fallback) { try { return localStorage.getItem(key) || fallb
 function store(key, value) { try { localStorage.setItem(key, value); } catch {} }
 const S = {
   data: null, week: monday(londonToday()), locationId: stored('rota-location', ''),
-  query: '', team: '', warehouse: '', view: stored('rota-view', matchMedia('(max-width: 720px)').matches ? 'day' : 'week'),
+  query: '', team: '', warehouse: '', view: matchMedia('(max-width: 720px)').matches ? 'day' : 'week',
   day: (new Date(`${londonToday()}T12:00:00Z`).getUTCDay() + 6) % 7,
+  dayWeek: '',
   coverageStart: '08:00', coverageEnd: '16:30', minimumCover: 1,
   selected: new Set(), authenticated: false, loading: false
 };
 if (readOnly && S.view === 'timeline') S.view = 'day';
 const rotaContent = () => S.view === 'timeline' && !readOnly ? renderTimeline() : S.view === 'week' ? renderGrid() : renderDay();
-let loadSequence = 0, toastTimer, focusBeforeDialog;
+let loadSequence = 0, profileSequence = 0, toastTimer, focusBeforeDialog;
 function toast(message, error = false) {
   $('toast').textContent = message;
   $('toast').className = error ? 'visible error' : 'visible';
@@ -102,6 +103,10 @@ async function load(background = false) {
       const valid = new Set(data.people.filter(p => p.active).map(p => p.id));
       for (const id of S.selected) if (!valid.has(id)) S.selected.delete(id);
     } else S.locationId = data.location.id;
+    if (S.dayWeek !== S.week) {
+      S.dayWeek = S.week;
+      S.day = S.week === monday(londonToday()) ? (new Date(`${londonToday()}T12:00:00Z`).getUTCDay() + 6) % 7 : Math.max(0, days.findIndex((_, index) => locationShifts().some(shift => shift.date === plusDays(S.week, index))));
+    }
     if (!same) render();
   } catch (error) {
     S.loading = false;
@@ -193,12 +198,14 @@ function renderGrid() {
 }
 function renderDay() {
   const date = plusDays(S.week, S.day), shifts = locationShifts().filter(s => s.date === date), people = visiblePeople();
+  const scheduledDay = days.findIndex((_, index) => locationShifts().some(shift => shift.date === plusDays(S.week, index)));
+  const emptyDay = !shifts.length ? `<div class="day-notice" role="status"><span>No shifts ${S.team || S.warehouse ? 'match these filters ' : ''}on ${h(shortDate(date, { weekday: 'long' }))}.${scheduledDay >= 0 ? ' Shifts are scheduled on other days this week.' : ''}</span><div>${scheduledDay >= 0 ? `<button class="button compact" data-action="day" data-day="${scheduledDay}">Show ${days[scheduledDay]}</button>` : ''}<button class="button compact" data-action="view-week">View full week</button></div></div>` : '';
   const tabs = days.map((d, i) => `<button class="day-tab ${i === S.day ? 'active' : ''}" data-action="day" data-day="${i}" aria-pressed="${i === S.day}"><span>${d}</span><strong>${shortDate(plusDays(S.week, i), { month: undefined })}</strong><small>${dayMetrics(plusDays(S.week, i)).count} on</small></button>`).join('');
   const rows = people.map(p => {
     const entries = shifts.filter(s => s.person_id === p.id);
     return `<article class="day-person"><div>${readOnly ? `<strong>${h(p.name)}</strong>` : `<button class="profile-link" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role">${h(departmentName(p))}${p.role ? ` · ${h(p.role)}` : ''}</span></div><div class="day-shifts">${entries.length ? entries.map(shiftCard).join('') : '<span class="off-label">No shift</span>'}${!readOnly && p.active ? `<button class="button compact" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)}">${icon('plus')}</button>` : ''}</div></article>`;
   }).join('');
-  return `<div class="day-tabs" aria-label="Choose day">${tabs}</div><div class="day-list">${rows || '<div class="empty-state"><h2>No colleagues to show</h2><p>Try a different filter or add colleagues.</p></div>'}</div>`;
+  return `<div class="day-tabs" aria-label="Choose day">${tabs}</div>${emptyDay}<div class="day-list">${rows || '<div class="empty-state"><h2>No colleagues to show</h2><p>Try a different filter or add colleagues.</p></div>'}</div>`;
 }
 function renderTimeline() {
   const date = plusDays(S.week, S.day);
@@ -368,21 +375,44 @@ function openTeam() {
   $('import-colleagues').onclick = openImport;
   $('team-list').onclick = event => { const row = event.target.closest('[data-edit-person]'); if (row) openProfile(row.dataset.editPerson); };
 }
+function finishedShift(shift) {
+  if (!['work', 'training'].includes(shift.kind)) return false;
+  const endDate = shift.end_time < shift.start_time ? plusDays(shift.date, 1) : shift.date;
+  const nowTime = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date());
+  return `${endDate}T${shift.end_time}` <= `${londonToday()}T${nowTime}`;
+}
 function openProfile(id) {
+  const profileSession = ++profileSequence;
   const p = S.data.people.find(p => p.id === id); if (!p) return;
   const shifts = S.data.shifts.filter(s => s.person_id === id);
-  modal(p.name, `<div class="profile-summary"><span class="department-tag ${departmentColour[defaultDepartment(p)] || 'blue'}">${h(departmentName(p))}</span>${p.is_example ? '<span class="example-tag">Example colleague</span>' : ''}<p>${h(p.role || 'Warehouse colleague')} · ${hours(personHours(id))}h scheduled this week</p></div><h3>Dashboard performance</h3><div id="profile-performance" aria-live="polite"><p class="field-help">Reading the dashboard…</p></div><h3>This week’s shifts</h3><div class="profile-shifts">${shifts.map(s => `<div><strong>${shortDate(s.date, { weekday: 'short' })}</strong>${shiftCard(s)}</div>`).join('') || '<p class="field-help">No shifts assigned this week.</p>'}</div>`, '<button type="button" class="button danger" id="delete-profile">Delete colleague</button><span class="footer-spacer"></span><button type="button" class="button" data-action="close-modal">Done</button><button type="button" class="button primary" id="edit-profile">Edit colleague</button>', true);
+  const previous = shifts.filter(finishedShift).sort((a, b) => b.date.localeCompare(a.date) || b.end_time.localeCompare(a.end_time));
+  const selectedDate = previous[0]?.date || londonToday();
+  modal(p.name, `<div class="profile-summary"><span class="department-tag ${departmentColour[defaultDepartment(p)] || 'blue'}">${h(departmentName(p))}</span>${p.is_example ? '<span class="example-tag">Example colleague</span>' : ''}<p>${h(p.role || 'Warehouse colleague')} · ${hours(personHours(id))}h scheduled in this rota week</p></div><h3>Recorded performance</h3><label class="profile-date-control">Performance date<input id="profile-performance-date" type="date" min="2020-01-01" max="${londonToday()}" value="${selectedDate}"></label><div id="profile-performance" aria-live="polite"><p class="field-help">Reading recorded performance…</p></div><h3>Shifts in this rota week</h3><div class="profile-shifts">${shifts.map(s => `<div><strong>${shortDate(s.date, { weekday: 'short' })}</strong>${shiftCard(s)}${finishedShift(s) ? `<button class="text-button profile-performance-button" type="button" data-performance-date="${s.date}">View recorded performance</button>` : ''}</div>`).join('') || '<p class="field-help">No shifts assigned in this rota week. Choose a date above to view earlier performance.</p>'}</div>`, '<button type="button" class="button danger" id="delete-profile">Delete colleague</button><span class="footer-spacer"></span><button type="button" class="button" data-action="close-modal">Done</button><button type="button" class="button primary" id="edit-profile">Edit colleague</button>', true);
   $('modal').dataset.profileId = id; $('edit-profile').onclick = () => editPerson(id); $('delete-profile').onclick = () => deletePerson(id);
-  api(`/api/people/${encodeURIComponent(id)}/performance`).then(data => {
-    if (!$('profile-performance') || $('modal').dataset.profileId !== id) return;
-    if (!data.configured) { $('profile-performance').innerHTML = '<p class="field-help">Connect your existing warehouse dashboard to show Picking and Packing totals, average per hour and peak hour.</p><button type="button" class="button" id="connect-from-profile">Connect dashboard</button>'; $('connect-from-profile').onclick = openDashboardSettings; return; }
-    const metric = value => value === null || value === undefined || !Number.isFinite(Number(value)) ? '—' : Number(value).toLocaleString('en-GB', { maximumFractionDigits: 1 });
-    $('profile-performance').innerHTML = `<p class="field-help">${data.mode === 'demo' ? 'Example dashboard data · ' : ''}${h(data.date || 'Today')} · Matched to ${h(data.matchedName)}${data.updatedAt ? ` · Updated ${h(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }).format(new Date(data.updatedAt)))}` : ''}</p>${data.stale ? '<p class="coverage-alert">The dashboard is unavailable. Showing the last retrieved data.</p>' : ''}${data.limited ? '<p class="coverage-alert">The dashboard needs the supplied update to include colleagues outside the top eight.</p>' : ''}${data.ambiguous ? '<p class="coverage-alert">More than one dashboard entry has this name. Check the colleague’s dashboard name.</p>' : ''}<div class="performance-grid">${['picking', 'packing'].map(kind => { const row = data[kind]; return `<section><h4 class="department-text ${kind === 'picking' ? 'blue' : 'teal'}">${kind === 'picking' ? 'Picking' : 'Packing'}</h4>${row ? `<strong>${metric(row.total)}<small>completed</small></strong><dl><div><dt>Daily rank</dt><dd>${metric(row.rank)}</dd></div><div><dt>Average / hour</dt><dd>${metric(row.avgPerHour)}</dd></div><div><dt>Peak hour</dt><dd>${metric(row.peakTotal)}${row.peakHour ? ` at ${h(row.peakHour)}` : ''}</dd></div></dl>` : '<p>No matching activity supplied by the dashboard.</p>'}</section>`; }).join('')}</div><p class="field-help">The current dashboard supplies Picking and Packing performance. Engraving performance is not available from it. Dashboard readings are shared across profiles and refresh at most once every five minutes.</p>`;
-  }).catch(error => { if ($('profile-performance') && $('modal').dataset.profileId === id) $('profile-performance').innerHTML = `<p class="form-error">${h(error.message)}</p>`; });
+  $('dialog-form').onsubmit = event => event.preventDefault();
+  let reading = 0;
+  const load = async date => {
+    const request = ++reading;
+    $('profile-performance').innerHTML = '<p class="field-help">Reading recorded performance…</p>';
+    try {
+      const data = await api(`/api/people/${encodeURIComponent(id)}/performance?date=${encodeURIComponent(date)}`);
+      if (!$('profile-performance') || $('modal').dataset.profileId !== id || reading !== request || profileSession !== profileSequence) return;
+      if (!data.configured) { $('profile-performance').innerHTML = '<p class="field-help">Connect your warehouse dashboard to view this colleague’s recorded Picking and Packing performance.</p><button type="button" class="button" id="connect-from-profile">Connect dashboard</button>'; $('connect-from-profile').onclick = openDashboardSettings; return; }
+      if (data.date !== date) throw new Error('The connection returned a different date. Install the employee history update in both apps.');
+      if (data.available === false) { $('profile-performance').innerHTML = `<p class="field-help">No performance snapshot was saved for ${h(shortDate(date))}. Missing history is not counted as zero.</p>`; return; }
+      const metric = value => value === null || value === undefined || !Number.isFinite(Number(value)) ? '—' : Number(value).toLocaleString('en-GB', { maximumFractionDigits: 1 });
+      const captured = data.snapshotTime || data.updatedAt;
+      const time = captured && Number.isFinite(Date.parse(captured)) ? new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }).format(new Date(captured)) : '';
+      $('profile-performance').innerHTML = `<p class="field-help">${data.mode === 'demo' ? 'Example data · ' : ''}${h(shortDate(date, { weekday: 'short' }))} · ${data.historical ? 'Recorded history' : 'Today so far'}${time ? ` · Captured ${h(time)}` : ''} · ${h(data.matchedName)}</p>${data.stale ? '<p class="coverage-alert">The dashboard is unavailable. Showing the last retrieved record for this date.</p>' : ''}${data.limited ? '<p class="coverage-alert">Older snapshots contain selected colleagues only. These figures may be incomplete; missing entries mean unavailable.</p>' : ''}${data.ambiguous ? '<p class="coverage-alert">More than one dashboard entry has this name. Check the colleague’s Dashboard name.</p>' : ''}<div class="performance-grid">${['picking', 'packing'].map(kind => { const row = data[kind]; return `<section><h4 class="department-text ${kind === 'picking' ? 'blue' : 'teal'}">${kind === 'picking' ? 'Picking' : 'Packing'}</h4>${row ? `<strong>${metric(row.total)}<small>completed on this date</small></strong><dl><div><dt>Average / hour</dt><dd>${metric(row.avgPerHour)}</dd></div><div><dt>Peak hour</dt><dd>${metric(row.peakTotal)}${row.peakHour ? ` at ${h(row.peakHour)}` : ''}</dd></div></dl>` : '<p>No recorded activity available for this colleague.</p>'}</section>`; }).join('')}</div><p class="field-help">These are the dashboard’s calendar-day readings, linked to the selected shift date. Multiple or overnight shifts are not measured separately. Engraving performance is not supplied. Open an earlier rota week or choose a date above to review previous work.</p>`;
+    } catch (error) { if ($('profile-performance') && $('modal').dataset.profileId === id && reading === request && profileSession === profileSequence) $('profile-performance').innerHTML = `<p class="form-error">${h(error.message)}</p>`; }
+  };
+  $('profile-performance-date').onchange = event => { if (event.target.value && event.target.reportValidity()) load(event.target.value); };
+  for (const button of $('modal').querySelectorAll('[data-performance-date]')) button.onclick = () => { $('profile-performance-date').value = button.dataset.performanceDate; load(button.dataset.performanceDate); };
+  load(selectedDate);
 }
 function openDashboardSettings() {
   const current = S.data.dashboard || {};
-  modal('Connect warehouse dashboard', `<p>Use the Render address of your existing Dylan Oaks dashboard. Colleague profiles read its Picking and Packing leaderboard.</p><label>Dashboard URL<input id="dashboard-url" type="url" value="${h(current.url || '')}" placeholder="https://your-dashboard.onrender.com" maxlength="200"></label><label>Integration key <span class="optional">${current.hasKey ? 'already saved - leave blank to keep it' : 'matches ROTA_API_KEY on the dashboard'}</span><input id="dashboard-key" type="password" autocomplete="new-password" maxlength="256"></label><p class="field-help">The package includes the dashboard update for all colleagues. Add the same integration key to that dashboard’s Render environment as ROTA_API_KEY. The key stays in the manager system. Each colleague’s name must match, or set their Dashboard leaderboard name in their profile.</p>`, `${cancel}<button class="button primary" type="submit">Save connection</button>`);
+  modal('Connect warehouse dashboard', `<p>Use the Render address of your existing Dylan Oaks dashboard. Colleague profiles read their own recorded Picking and Packing performance for a selected date.</p><label>Dashboard URL<input id="dashboard-url" type="url" value="${h(current.url || '')}" placeholder="https://your-dashboard.onrender.com" maxlength="200"></label><label>Integration key <span class="optional">${current.hasKey ? 'already saved - leave blank to keep it' : 'matches ROTA_API_KEY on the dashboard'}</span><input id="dashboard-key" type="password" autocomplete="new-password" maxlength="256"></label><p class="field-help">Install the employee history update on the dashboard to include all colleagues in future snapshots. Add the same integration key to that dashboard’s Render environment as ROTA_API_KEY. The key stays in the manager system. Each colleague’s name must match, or set their Dashboard name in their profile.</p>`, `${cancel}<button class="button primary" type="submit">Save connection</button>`);
   $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { const key = $('dashboard-key').value; await mutate('/api/dashboard/settings', { url: $('dashboard-url').value, ...(key ? { api_key: key } : {}) }); closeDialog(); toast('Dashboard connection saved. Open a colleague profile to view performance.'); }); };
 }
 function openPDF() {
@@ -406,7 +436,7 @@ function deletePerson(id) {
 }
 function editPerson(id) {
   const p = S.data.people.find(p => p.id === id) || { name: '', team: 'Warehouse', role: '', contract_minutes: 0, location_id: S.locationId, active: 1 };
-  modal(id ? 'Edit colleague' : 'Add colleague', `<label>Name<input id="person-name" value="${h(p.name)}" maxlength="120" required autocomplete="off"></label><div class="field-row"><label>Department <span class="optional">optional</span><select id="person-department"><option value="">Not set</option>${choices(departments, defaultDepartment(p))}</select></label><label>Role <span class="optional">optional</span><input id="person-role" value="${h(p.role)}" maxlength="80"></label></div><label>Dashboard leaderboard name <span class="optional">optional - uses the colleague name if blank</span><input id="person-leaderboard-name" maxlength="120" value="${h(p.leaderboard_name || '')}" autocomplete="off"></label><div class="field-row"><label>Contracted hours / week<input id="person-hours" type="number" value="${p.contract_minutes / 60}" min="0" max="100" step="0.25" required></label><label>Home location<select id="person-location">${S.data.locations.map(l => `<option value="${h(l.id)}" ${l.id === p.location_id ? 'selected' : ''}>${h(l.name)}</option>`).join('')}</select></label></div><p class="field-help">This department is preselected for new shifts and can be changed per shift. Saved shifts keep their assigned department. Set hours to 0 for colleagues without fixed contracted hours.</p>${id ? `<label class="check-label"><input id="person-active" type="checkbox" ${p.active ? 'checked' : ''}>Active colleague</label>` : ''}`, `${id ? '<button type="button" class="button danger" id="delete-colleague">Delete colleague</button><span class="footer-spacer"></span>' : ''}<button type="button" class="button" id="back-team">Back</button><button class="button primary" type="submit">Save colleague</button>`);
+  modal(id ? 'Edit colleague' : 'Add colleague', `<label>Name<input id="person-name" value="${h(p.name)}" maxlength="120" required autocomplete="off"></label><div class="field-row"><label>Department <span class="optional">optional</span><select id="person-department"><option value="">Not set</option>${choices(departments, defaultDepartment(p))}</select></label><label>Role <span class="optional">optional</span><input id="person-role" value="${h(p.role)}" maxlength="80"></label></div><label>Dashboard name <span class="optional">optional - uses the colleague name if blank</span><input id="person-leaderboard-name" maxlength="120" value="${h(p.leaderboard_name || '')}" autocomplete="off"></label><div class="field-row"><label>Contracted hours / week<input id="person-hours" type="number" value="${p.contract_minutes / 60}" min="0" max="100" step="0.25" required></label><label>Home location<select id="person-location">${S.data.locations.map(l => `<option value="${h(l.id)}" ${l.id === p.location_id ? 'selected' : ''}>${h(l.name)}</option>`).join('')}</select></label></div><p class="field-help">This department is preselected for new shifts and can be changed per shift. Saved shifts keep their assigned department. Set hours to 0 for colleagues without fixed contracted hours.</p>${id ? `<label class="check-label"><input id="person-active" type="checkbox" ${p.active ? 'checked' : ''}>Active colleague</label>` : ''}`, `${id ? '<button type="button" class="button danger" id="delete-colleague">Delete colleague</button><span class="footer-spacer"></span>' : ''}<button type="button" class="button" id="back-team">Back</button><button class="button primary" type="submit">Save colleague</button>`);
   $('back-team').onclick = openTeam;
   if (id) $('delete-colleague').onclick = () => deletePerson(id);
   $('dialog-form').onsubmit = event => {
@@ -503,9 +533,21 @@ function openShare() {
   $('print-qr').onclick = () => window.print();
   $('reset-link').onclick = () => { if (confirm('Reset the shared link? The existing QR code will stop working. You will need to print and share the new code.')) formAction($('dialog-form'), async () => { await mutate('/api/share/reset', { location_id: S.locationId }); openShare(); toast('New link created. Download and print the updated QR code.'); }); };
 }
+function downloadShiftReport() {
+  const known = new Set(S.data.people.map(p => p.id)), shown = new Set(visiblePeople().map(p => p.id));
+  const report = {
+    clientBuild: document.querySelector('meta[name="rota-layout"]')?.content, serverBuild: S.data.build || 'earlier version', generatedAt: new Date().toISOString(),
+    week: S.week, view: S.view, selectedDate: plusDays(S.week, S.day), locationId: S.locationId, filters: { department: S.team, warehouse: S.warehouse, nameSearch: S.query },
+    days: days.map((day, index) => { const date = plusDays(S.week, index), shifts = locationShifts().filter(s => s.date === date); return { day, date, shiftCount: shifts.length, colleaguesOn: dayMetrics(date).count, matchedToKnownColleagues: shifts.filter(s => known.has(s.person_id)).length, matchedToDisplayedColleagues: shifts.filter(s => shown.has(s.person_id)).length }; }),
+    people: S.data.people.map(p => ({ id: p.id, idType: typeof p.id, locationId: p.location_id, active: p.active })),
+    shifts: locationShifts().map(s => ({ id: s.id, personId: s.person_id, personIdType: typeof s.person_id, date: s.date, kind: s.kind, start: s.start_time, finish: s.end_time })),
+    renderedShifts: [...document.querySelectorAll('#rota-content .shift-card')].map(el => ({ id: el.dataset.id || null, text: el.textContent, display: getComputedStyle(el).display, height: el.getBoundingClientRect().height }))
+  };
+  downloadText(`rota-shift-report-${S.week}.json`, JSON.stringify(report, null, 2), 'application/json');
+}
 function openSettings() {
-  modal('Settings', `<div class="management-list"><button type="button" class="management-row" id="dashboard-settings"><span><strong>Dashboard connection</strong><small>Picking and Packing performance in colleague profiles.</small></span><span class="edit-label">Connect</span></button><button type="button" class="management-row" id="manage-locations"><span><strong>Locations</strong><small>Add other sites for separate rotas.</small></span><span class="edit-label">Manage</span></button><a class="management-row" href="/api/backup"><span><strong>Download data backup</strong><small>Save a complete copy of colleagues, shifts and published rotas.</small></span>${icon('download')}</a></div><p class="field-help">Seven daily backups are also retained on the server. Scheduled hours use the entered start and finish times, less unpaid breaks.</p>`, '<button type="button" class="button" data-action="close-modal">Done</button>');
-  $('manage-locations').onclick = openLocations; $('dashboard-settings').onclick = openDashboardSettings;
+  modal('Settings', `<div class="management-list"><button type="button" class="management-row" id="dashboard-settings"><span><strong>Dashboard connection</strong><small>Recorded employee performance in colleague profiles.</small></span><span class="edit-label">Connect</span></button><button type="button" class="management-row" id="manage-locations"><span><strong>Locations</strong><small>Add other sites for separate rotas.</small></span><span class="edit-label">Manage</span></button><button type="button" class="management-row" id="shift-display-report"><span><strong>Download shift display report</strong><small>Help diagnose shifts that are counted but missing from the rota.</small></span>${icon('download')}</button><a class="management-row" href="/api/backup"><span><strong>Download data backup</strong><small>Save a complete copy of colleagues, shifts and published rotas.</small></span>${icon('download')}</a></div><p class="field-help">Seven daily backups are also retained on the server. Scheduled hours use the entered start and finish times, less unpaid breaks.</p>`, '<button type="button" class="button" data-action="close-modal">Done</button>');
+  $('manage-locations').onclick = openLocations; $('dashboard-settings').onclick = openDashboardSettings; $('shift-display-report').onclick = downloadShiftReport;
 }
 function openLocations() {
   modal('Locations', `<div class="management-list">${S.data.locations.map(l => `<button type="button" class="management-row" data-edit-location="${h(l.id)}"><span><strong>${h(l.name)}</strong><small>${l.active ? 'Active' : 'Archived'} · separate rota and QR link</small></span><span class="edit-label">Edit</span></button>`).join('')}</div>`, '<button type="button" class="button" id="back-settings">Back</button><button type="button" class="button primary" id="add-location">Add location</button>');

@@ -18,6 +18,9 @@ dialog{border:1px solid var(--line);border-radius:14px;padding:0;width:580px;max
 .timeline-axis-row svg{height:26px}.timeline-person svg{height:30px}
 .training-mark{display:inline-block;margin-left:5px;font-size:.625rem;font-weight:500}
 .break-untimed-compact{display:none}
+.profile-date-control{max-width:240px;margin-bottom:16px}
+.day-notice{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 16px;background:#f3f6ff;border-bottom:1px solid var(--line);color:var(--muted);font-size:.8125rem}.day-notice>div{display:flex;gap:8px;flex-wrap:wrap}
+.profile-performance-button{margin-top:8px;font-size:.75rem;text-align:left}
 @media screen{
   .rota-table{min-width:70rem}
   .rota-table thead th{height:46px;padding:6px 8px}
