@@ -4,6 +4,7 @@ services:
   - type: web
     name: dylan-oaks-warehouse-rota
     runtime: node
+    rootDir: warehouse-rota
     region: frankfurt
     plan: 0.5c-512mb
     buildCommand: npm ci
