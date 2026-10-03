@@ -236,7 +236,7 @@ export function createRotaServer(options = {}) {
       dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
     }));
     return {
-      revision: revision(), week, demo, departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      revision: revision(), week, demo, build: 'compact-history-20261003', departments: DEPARTMENTS, warehouses: WAREHOUSES,
       previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
       dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
       locations: db.prepare('SELECT id, name, share_token, active FROM locations ORDER BY active DESC, name COLLATE NOCASE').all(),
@@ -434,7 +434,10 @@ export function createRotaServer(options = {}) {
         }
         if (method === 'GET' && pathname === '/api/state') return send(res, 200, state(weekValue(url.searchParams.get('week') || monday())));
         if (method === 'GET' && /^\/api\/people\/[^/]+\/performance$/.test(pathname)) {
-          try { return send(res, 200, await dashboard.profile(person(pathname.split('/')[3]))); }
+          const requestedDate = url.searchParams.get('date');
+          const date = requestedDate ? dateValue(requestedDate) : '';
+          requireThat(!date || date <= today(), 'Choose a performance date up to today.');
+          try { return send(res, 200, await dashboard.profile(person(pathname.split('/')[3]), date)); }
           catch (error) { if (error instanceof Problem) throw error; throw new Problem(502, error.message); }
         }
         if (method === 'GET' && pathname === '/api/export.pdf') return await sharePDF(res, location(url.searchParams.get('locationId')), url);
