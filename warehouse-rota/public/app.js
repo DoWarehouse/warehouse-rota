@@ -171,17 +171,22 @@ function isNoShow(shift) {
   return !readOnly && attendanceRecord(shift.person_id, shift.date, shift.location_id)?.status === 'no_show';
 }
 function rotaMinutes(shift) { return isNoShow(shift) ? 0 : minutes(shift); }
+function shiftLabel(shift) {
+  const label = String(shift.label || '').trim();
+  return label === 'Shift' || label === kindNames[shift.kind] ? '' : label;
+}
 function shiftCard(shift, weekly = false) {
   const working = ['work', 'training'].includes(shift.kind);
   const noShow = weekly === true && working && isNoShow(shift);
   const overnight = working && shift.end_time < shift.start_time;
+  const label = shiftLabel(shift);
   const detail = working ? `${hours(minutes(shift))}h${shift.break_minutes ? shift.break_start ? ` · Break ${shift.break_start}–${clockLabel(clockMinutes(shift.break_start) + shift.break_minutes)}` : ` · ${shift.break_minutes}m break (time unset)` : ''}` : 'All day';
   const assignment = [shift.department, shift.warehouse].filter(Boolean).join(' · ');
   const shortWarehouse = shift.warehouse === 'Warehouse 1' ? 'WH1' : shift.warehouse === 'Warehouse 2' ? 'WH2' : shift.warehouse;
   const untimedBreak = `<span class="break-untimed-full">${shift.break_minutes}m break (time unset)</span><span class="break-untimed-compact">Break ${shift.break_minutes}m · unset</span>`;
   const breakDetail = working && shift.break_minutes ? `<span class="shift-net">${hours(minutes(shift))}h · </span>${shift.break_start ? `Break ${h(shift.break_start)}–${clockLabel(clockMinutes(shift.break_start) + shift.break_minutes)}` : untimedBreak}` : h(detail);
   const title = [shift.label, working ? `${shift.start_time}–${shift.end_time}${overnight ? ' +1' : ''}` : kindNames[shift.kind], assignment, detail, noShow ? 'No show' : ''].filter(Boolean).join(' · ');
-  const content = `<span class="shift-time">${working ? `${h(shift.start_time)}–${h(shift.end_time)}${overnight ? '<sup>+1</sup>' : ''}` : h(kindNames[shift.kind])}${shift.kind === 'training' ? '<span class="training-mark">Training</span>' : ''}</span><span class="shift-label">${h(shift.label)}</span>${assignment || working ? `<span class="shift-assignment" title="${h(assignment)}">${assignment ? [shift.department, shortWarehouse].filter(Boolean).map(v => `<span>${h(v)}</span>`).join(' · ') : 'Set department and warehouse'}${working && !shift.warehouse && assignment ? ' · Set warehouse' : ''}</span>` : ''}<span class="shift-detail">${noShow ? '<span class="weekly-no-show">No show</span>' : breakDetail}</span>`;
+  const content = `<span class="shift-time"><span class="shift-clock">${working ? `${h(shift.start_time)}–${h(shift.end_time)}${overnight ? '<sup>+1</sup>' : ''}` : h(kindNames[shift.kind])}</span>${shift.kind === 'training' ? '<span class="training-mark">Training</span>' : ''}${label ? `<span class="shift-tag" title="${h(label)}">${h(label)}</span>` : ''}</span><span class="shift-label">${h(shift.label)}</span>${assignment || working ? `<span class="shift-assignment" title="${h(assignment)}">${assignment ? [shift.department, shortWarehouse].filter(Boolean).map(v => `<span>${h(v)}</span>`).join(' · ') : 'Set department and warehouse'}${working && !shift.warehouse && assignment ? ' · Set warehouse' : ''}</span>` : ''}<span class="shift-detail">${noShow ? '<span class="weekly-no-show">No show</span>' : breakDetail}</span>`;
   return readOnly ? `<div class="shift-card ${h(working ? departmentColour[shift.department] || shift.colour : shift.kind)}" title="${h(title)}">${content}</div>` : `<button class="shift-card ${h(working ? departmentColour[shift.department] || shift.colour : shift.kind)}" draggable="true" title="${h(title)} · Drag to another day or colleague" data-action="edit-shift" data-id="${h(shift.id)}" aria-label="Edit ${h(title)} on ${h(shift.date)}">${content}</button>`;
 }
 function renderGrid() {
@@ -344,8 +349,10 @@ function patternOptions(selected = '') {
 }
 function fieldsHTML(shift = {}, assignmentFields = '') {
   const assigning = Boolean(assignmentFields);
-  const nameField = `<label>${assigning ? 'Shift name (optional)' : 'Pattern name'}<input id="shift-label" maxlength="60" value="${h(shift.label || 'Shift')}" ${assigning ? '' : 'required'}></label>`;
-  return `<div class="field-row"><label>Type<select id="shift-kind">${Object.entries(kindNames).map(([k, v]) => `<option value="${k}" ${(shift.kind || 'work') === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>${assigning ? `<label>Pattern<select id="shift-pattern">${patternOptions()}</select></label>` : nameField}</div>${assignmentFields}<div id="working-fields"><div class="field-row"><label>Start<input id="shift-start" type="time" value="${h(shift.start_time || '')}" required></label><label>Finish<input id="shift-end" type="time" value="${h(shift.end_time || '')}" required></label></div><div class="field-row"><label>Break starts<input id="shift-break-start" type="time" value="${h(shift.break_start || '')}"></label><label>Unpaid break (mins)<input id="shift-break" type="number" min="0" max="240" step="1" value="${shift.break_minutes || 0}" required></label></div><p class="field-help" id="shift-duration">Choose times or select a pattern.</p></div><p class="field-help" id="sick-help" hidden>Sick is shown as Unavailable on the shared rota and PDFs.</p><details class="shift-more"><summary>More details</summary>${assigning ? nameField : ''}<label>Colour<select id="shift-colour">${['blue', 'teal', 'violet', 'amber'].map(c => `<option value="${c}" ${(shift.colour || 'blue') === c ? 'selected' : ''}>${c[0].toUpperCase() + c.slice(1)}</option>`).join('')}</select></label><label>Manager note <span class="optional">private</span><textarea id="shift-note" rows="2" maxlength="500">${h(shift.note || '')}</textarea></label></details>`;
+  const nameField = `<label>Pattern name<input id="shift-label" maxlength="60" value="${h(shift.label || 'Shift')}" required></label>`;
+  const labels = [...new Set(['B2B', ...S.data.shifts.map(shiftLabel).filter(Boolean)])];
+  const labelEditor = `<div class="shift-label-editor"><label for="shift-label">Shift label <span class="optional">optional</span></label><div class="shift-label-control"><input id="shift-label" maxlength="60" value="${h(shiftLabel(shift))}" placeholder="B2B or a manual label" list="shift-label-suggestions" autocomplete="off" title="Shown beside the shift time. Clear this field to remove the label."><button type="button" class="button compact" id="shift-label-b2b" aria-label="Use B2B label">B2B</button></div><datalist id="shift-label-suggestions">${labels.map(label => `<option value="${h(label)}"></option>`).join('')}</datalist></div>`;
+  return `<div class="field-row"><label>Type<select id="shift-kind">${Object.entries(kindNames).map(([k, v]) => `<option value="${k}" ${(shift.kind || 'work') === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>${assigning ? `<label>Pattern<select id="shift-pattern">${patternOptions()}</select></label>` : nameField}</div>${assignmentFields}<div id="working-fields"><div class="field-row"><label>Start<input id="shift-start" type="time" value="${h(shift.start_time || '')}" required></label><label>Finish<input id="shift-end" type="time" value="${h(shift.end_time || '')}" required></label></div><div class="field-row"><label>Break starts<input id="shift-break-start" type="time" value="${h(shift.break_start || '')}"></label><label>Unpaid break (mins)<input id="shift-break" type="number" min="0" max="240" step="1" value="${shift.break_minutes || 0}" required></label></div><p class="field-help" id="shift-duration">Choose times or select a pattern.</p></div>${assigning ? labelEditor : ''}<p class="field-help" id="sick-help" hidden>Sick is shown as Unavailable on the shared rota and PDFs.</p><details class="shift-more"><summary>More details</summary><label>Colour<select id="shift-colour">${['blue', 'teal', 'violet', 'amber'].map(c => `<option value="${c}" ${(shift.colour || 'blue') === c ? 'selected' : ''}>${c[0].toUpperCase() + c.slice(1)}</option>`).join('')}</select></label><label>Manager note <span class="optional">private</span><textarea id="shift-note" rows="2" maxlength="500">${h(shift.note || '')}</textarea></label></details>`;
 }
 function readShiftFields() {
   return { kind: $('shift-kind').value, label: $('shift-label').value, start_time: $('shift-start').value, end_time: $('shift-end').value, break_minutes: Number($('shift-break').value), break_start: $('shift-break-start').value || null, colour: $('shift-colour').value, note: $('shift-note').value, ...($('shift-department') ? { department: $('shift-department').value || ($('shift-person') ? '' : undefined), warehouse: $('shift-warehouse').value } : {}) };
@@ -373,10 +380,13 @@ function wireShiftFields() {
   }
   $('shift-kind').onchange = () => {
     const kind = $('shift-kind').value;
-    if (['holiday', 'sick', 'unavailable'].includes(kind)) $('shift-label').value = kindNames[kind];
+    if ($('shift-label-b2b')) {
+      if (['Shift', 'Holiday', 'Sick', 'Unavailable'].includes($('shift-label').value)) $('shift-label').value = '';
+    } else if (['holiday', 'sick', 'unavailable'].includes(kind)) $('shift-label').value = kindNames[kind];
     else if (['Holiday', 'Sick', 'Unavailable'].includes($('shift-label').value)) $('shift-label').value = 'Shift';
     update();
   };
+  if ($('shift-label-b2b')) $('shift-label-b2b').onclick = () => { $('shift-label').value = 'B2B'; $('shift-label').focus(); };
   for (const id of ['shift-start', 'shift-end', 'shift-break', 'shift-break-start']) $(id).oninput = update;
   if ($('shift-pattern')) $('shift-pattern').onchange = event => {
     const template = S.data.templates.find(t => t.id === event.target.value);

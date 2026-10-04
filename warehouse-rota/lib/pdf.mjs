@@ -41,10 +41,12 @@ export function rotaPDF(snapshot, { layout = 'warehouse', warehouse = '', depart
     txt('Hours', 28 + width - hoursWidth + 3, y + 8, hoursWidth - 6, 8, true); y += 29;
   }
   function entryText(s) {
-    if (!['work', 'training'].includes(s.kind)) return s.kind === 'holiday' ? 'Holiday' : 'Unavailable';
+    const kindName = { work: 'Work', training: 'Training', holiday: 'Holiday', sick: 'Unavailable', unavailable: 'Unavailable' }[s.kind];
+    const label = s.label && !['Shift', kindName].includes(s.label) ? s.label : '';
+    if (!['work', 'training'].includes(s.kind)) return [kindName, label].filter(Boolean).join('\n');
     const time = `${s.start_time}-${s.end_time}${s.end_time < s.start_time ? ' +1' : ''}`;
     const assignment = compact ? `${s.warehouse === 'Warehouse 2' ? 'WH2' : s.warehouse === 'Warehouse 1' ? 'WH1' : '?'} | ${abbreviations[s.department] || '?'}` : `${s.department || 'Department unset'}\n${s.warehouse || 'Warehouse unset'}`;
-    return [time, s.kind === 'training' ? 'Training' : '', assignment, compact ? (s.break_start ? breakLabel(s) : s.break_minutes ? `Break ${s.break_minutes}m - unset` : '') : breakLabel(s)].filter(Boolean).join('\n');
+    return [time, s.kind === 'training' ? 'Training' : '', label, assignment, compact ? (s.break_start ? breakLabel(s) : s.break_minutes ? `Break ${s.break_minutes}m - unset` : '') : breakLabel(s)].filter(Boolean).join('\n');
   }
   function row(person, entries, group) {
     const columns = Array.from({ length: 7 }, (_, i) => entries.filter(s => s.date === plusDays(snapshot.week, i)));
