@@ -259,7 +259,7 @@ export function createRotaServer(options = {}) {
       dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
     }));
     return {
-      revision: revision(), week, demo, build: 'rota-daily-tools-20261004', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      revision: revision(), week, demo, build: 'rota-week-controls-20261004', departments: DEPARTMENTS, warehouses: WAREHOUSES,
       previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
       dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
       locations: db.prepare('SELECT id, name, share_token, active FROM locations ORDER BY active DESC, name COLLATE NOCASE').all(),
@@ -267,7 +267,7 @@ export function createRotaServer(options = {}) {
       templates: db.prepare('SELECT * FROM templates ORDER BY name COLLATE NOCASE').all(),
       shifts: db.prepare('SELECT * FROM shifts WHERE date BETWEEN ? AND ? ORDER BY date, start_time, id').all(week, addDays(week, 6)),
       attendance: db.prepare('SELECT * FROM attendance WHERE date BETWEEN ? AND ? ORDER BY date, person_id').all(week, addDays(week, 6)),
-      dayPlans: db.prepare('SELECT * FROM day_plans WHERE date BETWEEN ? AND ? ORDER BY date, location_id').all(week, addDays(week, 6)),
+      dayPlans: db.prepare('SELECT location_id, date, requirement_minutes FROM day_plans WHERE date BETWEEN ? AND ? AND requirement_minutes IS NOT NULL ORDER BY date, location_id').all(week, addDays(week, 6)),
       publications
     };
   }
@@ -526,9 +526,9 @@ export function createRotaServer(options = {}) {
               requireThat((typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10000, `${name} must be hours between 0 and 10,000, or left blank.`);
               return Math.round(Number(value) * 60);
             };
-            const budget = toMinutes(body.budget_hours, 'Budget'), required = toMinutes(body.requirement_hours, 'Requirement');
-            if (budget === null && required === null) db.prepare('DELETE FROM day_plans WHERE location_id = ? AND date = ?').run(loc.id, date);
-            else db.prepare('INSERT INTO day_plans VALUES (?, ?, ?, ?) ON CONFLICT(location_id, date) DO UPDATE SET budget_minutes = excluded.budget_minutes, requirement_minutes = excluded.requirement_minutes').run(loc.id, date, budget, required);
+            const required = toMinutes(body.requirement_hours, 'Required hours');
+            if (required === null) db.prepare('DELETE FROM day_plans WHERE location_id = ? AND date = ?').run(loc.id, date);
+            else db.prepare('INSERT INTO day_plans (location_id, date, budget_minutes, requirement_minutes) VALUES (?, ?, NULL, ?) ON CONFLICT(location_id, date) DO UPDATE SET budget_minutes = NULL, requirement_minutes = excluded.requirement_minutes').run(loc.id, date, required);
             return { saved: true };
           }
           if (method === 'POST' && pathname === '/api/dashboard/settings') {
@@ -599,6 +599,16 @@ export function createRotaServer(options = {}) {
             for (const person_id of people) for (const date of dates) pending.push(validateShift({ ...body, person_id, date }, undefined, pending));
             for (const shift of pending) insertShift.run(...shiftArgs(shift));
             return { created: pending.length };
+          }
+          if (method === 'POST' && pathname === '/api/shifts/clear') {
+            const loc = location(body.location_id);
+            requireThat(body.scope === 'day' || body.scope === 'week', 'Choose a day or week to clear.');
+            requireThat(body.confirm === true, 'Confirm clearing these draft shifts.');
+            const start = body.scope === 'day' ? dateValue(body.date) : weekValue(body.week);
+            const end = body.scope === 'day' ? start : addDays(start, 6);
+            // Clear only assignments: recorded attendance, requirements and publications stay saved.
+            const removed = db.prepare('DELETE FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ?').run(loc.id, start, end);
+            return { cleared: true, removed_shifts: Number(removed.changes), scope: body.scope, start_date: start, end_date: end };
           }
           if (method === 'POST' && pathname === '/api/weeks/copy') {
             const loc = location(body.location_id), week = weekValue(body.week);

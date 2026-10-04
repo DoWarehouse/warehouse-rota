@@ -97,9 +97,10 @@ dialog{border:1px solid var(--line);border-radius:14px;padding:0;width:580px;max
 #rota-content{display:block;width:100%;min-width:0}
 .day-view{display:block;width:100%;min-width:0;grid-column:1/-1}
 .day-view .day-tabs{width:100%;grid-template-columns:repeat(7,minmax(0,1fr))}
-.day-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.day-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:12px 16px;border-bottom:1px solid var(--line)}
 .day-heading h2{margin:0;font-size:1rem;letter-spacing:0}
-.day-planning{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:12px 16px 6px}
+.day-actions{display:flex;gap:8px;flex-wrap:wrap}
+.day-planning{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:12px 16px 6px}
 .day-stat{padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:#f8f9fc;min-width:0}
 .day-stat>span{display:block;font-size:.75rem;color:var(--muted)}
 .day-stat>strong{display:block;margin:3px 0;font-size:1.35rem}
@@ -126,6 +127,11 @@ dialog{border:1px solid var(--line);border-radius:14px;padding:0;width:580px;max
 .attendance-record{font-size:.6875rem;color:var(--muted)}
 .day-plan-link{display:block;width:100%;border:0;background:transparent;color:var(--blue);padding:4px 1px 0;font-size:.5625rem;font-weight:500;line-height:1.4;white-space:normal}
 .day-plan-link:hover{text-decoration:underline}
+.rota-table .no-show-cell{background:#fff2f3}
+.rota-table .no-show-cell:hover,.rota-table .no-show-cell:focus-within{background:#fce8eb}
+.weekly-no-show{display:inline-block;color:#9a3041;font-size:inherit;font-weight:700;line-height:inherit}
+.weekly-no-show.standalone{font-size:.625rem;padding:4px 7px}
+.button:disabled{opacity:.45;cursor:default}
 .shift-card.sick{background:#fff2e9;border-color:#ebd4c2;border-left-color:#bd8256;color:#8d5933}
 .legend-sick{background:#bd8256}
 .shift-card[draggable=true]{cursor:grab}
@@ -140,6 +146,7 @@ dialog{border:1px solid var(--line);border-radius:14px;padding:0;width:580px;max
 .shift-dialog .field-row{gap:12px}
 .shift-dialog .field-help{font-size:.75rem;margin-bottom:10px}
 @media screen and (max-width:720px){
+  .edit-actions .clear-rota-button{flex:0 0 100%;min-height:32px}
   .day-heading{padding:10px}
   .day-heading h2{font-size:.8125rem}
   .day-heading .button{font-size:.6875rem}
