@@ -92,3 +92,73 @@ dialog{border:1px solid var(--line);border-radius:14px;padding:0;width:580px;max
   .day-shifts .shift-time{font-size:.8125rem}
   .day-shifts .shift-detail{font-size:.625rem}
 }
+
+/* Daily planning and attendance have a separate full-width layout. */
+#rota-content{display:block;width:100%;min-width:0}
+.day-view{display:block;width:100%;min-width:0;grid-column:1/-1}
+.day-view .day-tabs{width:100%;grid-template-columns:repeat(7,minmax(0,1fr))}
+.day-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line)}
+.day-heading h2{margin:0;font-size:1rem;letter-spacing:0}
+.day-planning{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:12px 16px 6px}
+.day-stat{padding:9px 12px;border:1px solid var(--line);border-radius:8px;background:#f8f9fc;min-width:0}
+.day-stat>span{display:block;font-size:.75rem;color:var(--muted)}
+.day-stat>strong{display:block;margin:3px 0;font-size:1.35rem}
+.day-stat strong small{font-size:.875rem;margin-left:2px;font-weight:400}
+.day-stat>small{display:block;font-size:.6875rem;line-height:1.4;color:var(--muted)}
+.day-stat.short{background:#fff5eb;border-color:#ecd4b4}
+.day-stat.short>small{color:#885319}
+.day-scope{padding:3px 16px 10px;margin:0;font-size:.6875rem;line-height:1.6;color:var(--muted);border-bottom:1px solid var(--line)}
+.attendance-summary{display:block;color:var(--ink);font-weight:600}
+.day-view .day-list{max-height:60dvh;min-height:180px;width:100%}
+.day-view .day-person{display:grid;grid-template-columns:minmax(160px,1fr) minmax(160px,2fr) 220px;align-items:center;gap:12px;padding:6px 16px;width:100%;min-width:0}
+.day-view.read-only .day-person{grid-template-columns:minmax(160px,1fr) minmax(160px,2fr)}
+.day-view .day-person-name{min-width:0}
+.day-person-name .profile-link{max-width:100%;overflow-wrap:anywhere;text-align:left}
+.day-view .day-shifts{max-width:none;width:100%;min-width:0;justify-content:flex-start;flex-wrap:wrap;gap:5px}
+.day-view .day-shifts .shift-card{min-width:125px;max-width:200px}
+.attendance-controls{display:flex;align-items:center;justify-content:flex-end;gap:4px;min-width:0;flex-wrap:wrap}
+.attendance-button{font-size:.6875rem;font-weight:600;border:1px solid var(--line);background:#fff;border-radius:6px;padding:6px 8px;min-height:30px;white-space:nowrap}
+.attendance-button:hover{background:#f0f3f8}
+.attendance-button:disabled{cursor:default;opacity:.45}
+.attendance-button.marked.checked_in{background:#e6f5ec;border-color:#a9d5bb;color:#216841}
+.attendance-button.marked.no_show{background:#fceced;border-color:#e9b7bd;color:#9a3041}
+.attendance-clear{border:0;background:none;padding:6px 4px;font-size:.625rem;color:var(--muted);text-decoration:underline}
+.attendance-record{font-size:.6875rem;color:var(--muted)}
+.day-plan-link{display:block;width:100%;border:0;background:transparent;color:var(--blue);padding:4px 1px 0;font-size:.5625rem;font-weight:500;line-height:1.4;white-space:normal}
+.day-plan-link:hover{text-decoration:underline}
+.shift-card.sick{background:#fff2e9;border-color:#ebd4c2;border-left-color:#bd8256;color:#8d5933}
+.legend-sick{background:#bd8256}
+.shift-card[draggable=true]{cursor:grab}
+.shift-card.shift-dragging{opacity:.4;cursor:grabbing}
+.shift-drop-target{outline:2px solid var(--blue)!important;outline-offset:-2px;background:#edf2ff!important}
+.dragging-shift .cell-add{pointer-events:none}
+.shift-more{margin:4px 0 0;border-top:1px solid var(--line);padding-top:10px}
+.shift-more summary{font-size:.8125rem;color:var(--muted);cursor:pointer}
+.shift-more[open] summary{margin-bottom:12px}
+.shift-dialog .dialog-body{padding:16px 20px}
+.shift-dialog .dialog-body label:not(.check-label):not(.person-check){gap:5px;margin-bottom:12px;font-size:.8125rem}
+.shift-dialog .field-row{gap:12px}
+.shift-dialog .field-help{font-size:.75rem;margin-bottom:10px}
+@media screen and (max-width:720px){
+  .day-heading{padding:10px}
+  .day-heading h2{font-size:.8125rem}
+  .day-heading .button{font-size:.6875rem}
+  .day-planning{padding:10px 10px 5px;gap:6px}
+  .day-stat{padding:8px}
+  .day-stat>strong{font-size:1.125rem}
+  .day-stat>small{font-size:.625rem}
+  .day-scope{padding:3px 10px 9px}
+  .day-view .day-person,.day-view.read-only .day-person{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:5px 8px;padding:8px 10px}
+  .day-view .attendance-controls{grid-column:1/-1;justify-content:flex-start}
+  .day-view .attendance-controls:empty{display:none}
+  .day-view .day-shifts .shift-card{min-width:0;width:calc(100% - 34px);max-width:none;flex:1 1 calc(100% - 34px)}
+  .day-view .day-shifts .compact{display:inline-flex}
+  .day-person-name .profile-link{font-size:.8125rem}
+  .shift-dialog .dialog-body{padding:14px}
+  .shift-dialog .field-row{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px}
+}
+@media print{
+  .day-planning,.day-scope,.attendance-controls,.day-heading .button,.day-plan-link{display:none!important}
+  .day-view .day-list{max-height:none;min-height:0;overflow:visible}
+  .day-view .day-person{grid-template-columns:1fr 2fr}
+}

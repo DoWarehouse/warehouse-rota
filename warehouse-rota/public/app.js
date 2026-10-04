@@ -9,7 +9,7 @@ const warehouses = ['Warehouse 1', 'Warehouse 2'];
 const defaultDepartment = p => p.default_department ?? (departments.includes(p.team) ? p.team : '');
 const departmentName = p => defaultDepartment(p) || 'No department';
 const choices = (items, selected) => items.map(v => `<option value="${h(v)}" ${v === selected ? 'selected' : ''}>${h(v)}</option>`).join('');
-const kindNames = { work: 'Work', training: 'Training', holiday: 'Holiday', unavailable: 'Unavailable' };
+const kindNames = { work: 'Work', training: 'Training', holiday: 'Holiday', sick: 'Sick', unavailable: 'Unavailable' };
 const paths = {
   calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 11h18"/>',
   people: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
@@ -52,7 +52,7 @@ const S = {
   day: (new Date(`${londonToday()}T12:00:00Z`).getUTCDay() + 6) % 7,
   dayWeek: '',
   coverageStart: '08:00', coverageEnd: '16:30', minimumCover: 1,
-  selected: new Set(), authenticated: false, loading: false
+  selected: new Set(), authenticated: false, loading: false, saving: false
 };
 if (readOnly && S.view === 'timeline') S.view = 'day';
 const rotaContent = () => S.view === 'timeline' && !readOnly ? renderTimeline() : S.view === 'week' ? renderGrid() : renderDay();
@@ -116,10 +116,14 @@ async function load(background = false) {
   $('app').setAttribute('aria-busy', 'false');
 }
 async function mutate(url, body = {}, method = 'POST') {
-  const result = await api(url, { method, body: JSON.stringify(body) });
-  if (S.data) S.data.revision = result.revision;
-  await load();
-  return result;
+  if (S.saving) throw new Error('The previous change is still saving.');
+  S.saving = true;
+  try {
+    const result = await api(url, { method, body: JSON.stringify(body) });
+    if (S.data) S.data.revision = result.revision;
+    await load();
+    return result;
+  } finally { S.saving = false; }
 }
 async function formAction(form, action) {
   const buttons = [...form.querySelectorAll('button')];
@@ -170,7 +174,7 @@ function shiftCard(shift) {
   const breakDetail = working && shift.break_minutes ? `<span class="shift-net">${hours(minutes(shift))}h · </span>${shift.break_start ? `Break ${h(shift.break_start)}–${clockLabel(clockMinutes(shift.break_start) + shift.break_minutes)}` : untimedBreak}` : h(detail);
   const title = [shift.label, working ? `${shift.start_time}–${shift.end_time}${overnight ? ' +1' : ''}` : kindNames[shift.kind], assignment, detail].filter(Boolean).join(' · ');
   const content = `<span class="shift-time">${working ? `${h(shift.start_time)}–${h(shift.end_time)}${overnight ? '<sup>+1</sup>' : ''}` : h(kindNames[shift.kind])}${shift.kind === 'training' ? '<span class="training-mark">Training</span>' : ''}</span><span class="shift-label">${h(shift.label)}</span>${assignment || working ? `<span class="shift-assignment" title="${h(assignment)}">${assignment ? [shift.department, shortWarehouse].filter(Boolean).map(v => `<span>${h(v)}</span>`).join(' · ') : 'Set department and warehouse'}${working && !shift.warehouse && assignment ? ' · Set warehouse' : ''}</span>` : ''}<span class="shift-detail">${breakDetail}</span>`;
-  return readOnly ? `<div class="shift-card ${h(working ? departmentColour[shift.department] || shift.colour : shift.kind)}" title="${h(title)}">${content}</div>` : `<button class="shift-card ${h(working ? departmentColour[shift.department] || shift.colour : shift.kind)}" title="${h(title)}" data-action="edit-shift" data-id="${h(shift.id)}" aria-label="Edit ${h(title)} on ${h(shift.date)}">${content}</button>`;
+  return readOnly ? `<div class="shift-card ${h(working ? departmentColour[shift.department] || shift.colour : shift.kind)}" title="${h(title)}">${content}</div>` : `<button class="shift-card ${h(working ? departmentColour[shift.department] || shift.colour : shift.kind)}" draggable="true" title="${h(title)} · Drag to another day or colleague" data-action="edit-shift" data-id="${h(shift.id)}" aria-label="Edit ${h(title)} on ${h(shift.date)}">${content}</button>`;
 }
 function renderGrid() {
   const people = visiblePeople(), shifts = locationShifts();
@@ -178,7 +182,8 @@ function renderGrid() {
   const allSelected = people.filter(p => p.active).length > 0 && people.filter(p => p.active).every(p => S.selected.has(p.id));
   const head = days.map((day, index) => {
     const date = plusDays(S.week, index), stats = dayMetrics(date);
-    return `<th class="day-column ${date === londonToday() ? 'today-column' : ''}" scope="col"><span class="day-name">${day}</span><span class="day-date">${shortDate(date, { month: undefined })}</span><span class="day-summary">${stats.count} on · ${hours(stats.minutes)}h</span></th>`;
+    const plan = (S.data.dayPlans || []).find(p => p.location_id === S.locationId && p.date === date);
+    return `<th class="day-column ${date === londonToday() ? 'today-column' : ''}" scope="col"><span class="day-name">${day}</span><span class="day-date">${shortDate(date, { month: undefined })}</span><span class="day-summary">${stats.count} on · ${hours(stats.minutes)}h</span>${!readOnly ? `<button class="day-plan-link" data-action="day-hours" data-date="${date}" aria-label="Set required and budget hours for ${shortDate(date)}">${plan ? [plan.requirement_minutes !== null ? `Required ${hours(plan.requirement_minutes)}h` : '', plan.budget_minutes !== null ? `Budget ${hours(plan.budget_minutes)}h` : ''].filter(Boolean).join(' · ') : 'Set day hours'}</button>` : ''}</th>`;
   }).join('');
   let lastTeam = '';
   const rows = people.map(p => {
@@ -189,7 +194,7 @@ function renderGrid() {
     const over = !readOnly && p.contract_minutes > 0 && total > p.contract_minutes;
     const cells = days.map((_, index) => {
       const date = plusDays(S.week, index), entries = shifts.filter(s => s.person_id === p.id && s.date === date);
-      return `<td class="shift-cell ${date === londonToday() ? 'today-column' : ''}">${entries.map(shiftCard).join('')}${!readOnly && p.active ? `<button class="cell-add ${entries.length ? 'small' : ''}" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)} on ${shortDate(date)}">${icon('plus')}</button>` : !entries.length ? '<span class="off-day">—</span>' : ''}</td>`;
+      return `<td class="shift-cell ${date === londonToday() ? 'today-column' : ''}" ${!readOnly && p.active ? `data-drop-person="${h(p.id)}" data-drop-date="${date}"` : ''}>${entries.map(shiftCard).join('')}${!readOnly && p.active ? `<button class="cell-add ${entries.length ? 'small' : ''}" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)} on ${shortDate(date)}">${icon('plus')}</button>` : !entries.length ? '<span class="off-day">—</span>' : ''}</td>`;
     }).join('');
     const initials = p.name.split(/\s+/).slice(0, 2).map(n => n[0]).join('');
     return `${separator}<tr class="colleague-row">${!readOnly ? `<td class="check-cell"><input type="checkbox" data-select-person="${h(p.id)}" aria-label="Select ${h(p.name)}" ${S.selected.has(p.id) ? 'checked' : ''} ${p.active ? '' : 'disabled'}></td>` : ''}<th class="person-column" scope="row"><div class="person-name-row"><span class="avatar">${h(initials)}</span><span>${readOnly ? `<span class="person-name" title="${h(p.name)}">${h(p.name)}</span>` : `<button class="person-name profile-link" title="${h(p.name)}" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role" title="${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}">${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}</span></span></div></th>${cells}<td class="hours-column ${over ? 'over-hours' : ''}" title="${readOnly ? 'Scheduled hours' : 'Scheduled hours across all locations'}"><strong>${hours(total)}<small>h</small></strong>${!readOnly && p.contract_minutes > 0 ? `<span>of ${hours(p.contract_minutes)}h</span>` : ''}</td></tr>`;
@@ -200,12 +205,35 @@ function renderDay() {
   const date = plusDays(S.week, S.day), shifts = locationShifts().filter(s => s.date === date), people = visiblePeople();
   const scheduledDay = days.findIndex((_, index) => locationShifts().some(shift => shift.date === plusDays(S.week, index)));
   const emptyDay = !shifts.length ? `<div class="day-notice" role="status"><span>No shifts ${S.team || S.warehouse ? 'match these filters ' : ''}on ${h(shortDate(date, { weekday: 'long' }))}.${scheduledDay >= 0 ? ' Shifts are scheduled on other days this week.' : ''}</span><div>${scheduledDay >= 0 ? `<button class="button compact" data-action="day" data-day="${scheduledDay}">Show ${days[scheduledDay]}</button>` : ''}<button class="button compact" data-action="view-week">View full week</button></div></div>` : '';
-  const tabs = days.map((d, i) => `<button class="day-tab ${i === S.day ? 'active' : ''}" data-action="day" data-day="${i}" aria-pressed="${i === S.day}"><span>${d}</span><strong>${shortDate(plusDays(S.week, i), { month: undefined })}</strong><small>${dayMetrics(plusDays(S.week, i)).count} on</small></button>`).join('');
+  const tabs = days.map((d, i) => `<button class="day-tab ${i === S.day ? 'active' : ''}" data-action="day" data-day="${i}" data-drop-date="${plusDays(S.week, i)}" aria-pressed="${i === S.day}"><span>${d}</span><strong>${shortDate(plusDays(S.week, i), { month: undefined })}</strong><small>${dayMetrics(plusDays(S.week, i)).count} on</small></button>`).join('');
   const rows = people.map(p => {
     const entries = shifts.filter(s => s.person_id === p.id);
-    return `<article class="day-person"><div>${readOnly ? `<strong>${h(p.name)}</strong>` : `<button class="profile-link" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role">${h(departmentName(p))}${p.role ? ` · ${h(p.role)}` : ''}</span></div><div class="day-shifts">${entries.length ? entries.map(shiftCard).join('') : '<span class="off-label">No shift</span>'}${!readOnly && p.active ? `<button class="button compact" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)}">${icon('plus')}</button>` : ''}</div></article>`;
+    return `<article class="day-person" data-person="${h(p.id)}" data-date="${date}" ${!readOnly && p.active ? `data-drop-person="${h(p.id)}" data-drop-date="${date}"` : ''}><div class="day-person-name">${readOnly ? `<strong>${h(p.name)}</strong>` : `<button class="profile-link" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role">${h(departmentName(p))}${p.role ? ` · ${h(p.role)}` : ''}</span></div><div class="day-shifts">${entries.length ? entries.map(shiftCard).join('') : '<span class="off-label">No shift</span>'}${!readOnly && p.active ? `<button class="button compact" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)}">${icon('plus')}</button>` : ''}</div>${!readOnly ? attendanceControls(p, entries, date) : ''}</article>`;
   }).join('');
-  return `<div class="day-tabs" aria-label="Choose day">${tabs}</div>${emptyDay}<div class="day-list">${rows || '<div class="empty-state"><h2>No colleagues to show</h2><p>Try a different filter or add colleagues.</p></div>'}</div>`;
+  return `<section class="day-view ${readOnly ? 'read-only' : ''}" data-selected-date="${date}"><div class="day-tabs" aria-label="Choose day">${tabs}</div><div class="day-heading"><h2>${h(shortDate(date, { weekday: 'long', year: 'numeric' }))}</h2>${!readOnly ? `<button class="button compact" data-action="day-hours" data-date="${date}">Set day hours</button>` : ''}</div>${!readOnly ? dayPlanningHTML(date) : ''}${emptyDay}<div class="day-list">${rows || '<div class="empty-state"><h2>No colleagues to show</h2><p>Try a different filter or add colleagues.</p></div>'}</div></section>`;
+}
+function attendanceControls(p, entries, date) {
+  const record = (S.data.attendance || []).find(a => a.person_id === p.id && a.location_id === S.locationId && a.date === date);
+  const scheduled = entries.some(s => ['work', 'training'].includes(s.kind));
+  if (!scheduled && !record) return '<div class="attendance-controls"></div>';
+  const available = date <= londonToday();
+  const button = (status, label) => `<button class="attendance-button ${record?.status === status ? 'marked ' + status : ''}" data-action="attendance" data-person="${h(p.id)}" data-date="${date}" data-status="${status}" aria-label="${label} for ${h(p.name)} on ${shortDate(date)}" aria-pressed="${record?.status === status}" ${!available || !scheduled ? 'disabled' : ''}>${status === 'checked_in' && record?.status === status ? 'Checked in' : label}</button>`;
+  return `<div class="attendance-controls" title="${record ? `Marked ${h(new Date(record.marked_at).toLocaleString('en-GB', { timeZone: 'Europe/London' }))}` : available ? 'Manager attendance record for this day' : 'Attendance is available on the shift date'}">${scheduled ? button('checked_in', 'Check in') + button('no_show', 'No show') : `<span class="attendance-record ${record.status}">${record.status === 'checked_in' ? 'Checked in' : 'No show'} · no work shift</span>`}${record ? `<button class="attendance-clear" data-action="attendance" data-person="${h(p.id)}" data-date="${date}" data-status="unmarked" aria-label="Clear attendance for ${h(p.name)}">Clear</button>` : ''}</div>`;
+}
+function dayPlanningHTML(date) {
+  const plan = (S.data.dayPlans || []).find(p => p.location_id === S.locationId && p.date === date);
+  const dayShifts = allLocationShifts().filter(s => s.date === date && ['work', 'training'].includes(s.kind));
+  const scheduled = dayShifts.reduce((total, s) => total + minutes(s), 0);
+  const required = plan?.requirement_minutes ?? null, budget = plan?.budget_minutes ?? null;
+  const people = new Set(dayShifts.map(s => s.person_id));
+  const attendance = (S.data.attendance || []).filter(a => a.location_id === S.locationId && a.date === date && people.has(a.person_id));
+  const checked = attendance.filter(a => a.status === 'checked_in').length, absent = attendance.filter(a => a.status === 'no_show').length;
+  return `<div class="day-planning"><div class="day-stat"><span>Scheduled</span><strong>${hours(scheduled)}<small>h</small></strong><small>${people.size} colleagues · after unpaid breaks</small></div><div class="day-stat ${required !== null && scheduled < required ? 'short' : ''}"><span>Required</span><strong>${required === null ? '—' : hours(required) + '<small>h</small>'}</strong><small>${required === null ? 'Set the hours you need' : scheduled < required ? `${hours(required - scheduled)}h short` : `${hours(scheduled - required)}h above requirement`}</small></div><div class="day-stat ${budget !== null && scheduled > budget ? 'short' : ''}"><span>Budget</span><strong>${budget === null ? '—' : hours(budget) + '<small>h</small>'}</strong><small>${budget === null ? 'Set your allowed hours' : scheduled > budget ? `${hours(scheduled - budget)}h over budget` : `${hours(budget - scheduled)}h remaining`}</small></div></div><p class="day-scope">Hours cover ${h(currentLocation().name)}, both warehouses and all departments. Overnight hours count on the shift’s start date.${date <= londonToday() ? ` <span class="attendance-summary">${checked} checked in · ${absent} no show · ${people.size - checked - absent} unmarked</span>` : ' Attendance opens on the shift date.'}</p>`;
+}
+function openDayHours(date) {
+  const plan = (S.data.dayPlans || []).find(p => p.location_id === S.locationId && p.date === date);
+  modal('Daily hours', `<p>${h(shortDate(date, { weekday: 'long', year: 'numeric' }))} · ${h(currentLocation().name)}</p><div class="field-row"><label>Required hours<input id="day-required" type="number" min="0" max="10000" step="0.01" value="${plan?.requirement_minutes === null || plan?.requirement_minutes === undefined ? '' : Number((plan.requirement_minutes / 60).toFixed(2))}" placeholder="e.g. 320"></label><label>Budget hours<input id="day-budget" type="number" min="0" max="10000" step="0.01" value="${plan?.budget_minutes === null || plan?.budget_minutes === undefined ? '' : Number((plan.budget_minutes / 60).toFixed(2))}" placeholder="e.g. 340"></label></div><p class="field-help">Set totals for both warehouses and all departments at this location. Leave a field blank to remove its target. Scheduled hours exclude unpaid breaks and absences.</p>`, `${cancel}<button type="submit" class="button primary">Save hours</button>`);
+  $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { await mutate('/api/day-plans', { location_id: S.locationId, date, requirement_hours: $('day-required').value, budget_hours: $('day-budget').value }); closeDialog(); toast('Daily hours saved.'); }); };
 }
 function renderTimeline() {
   const date = plusDays(S.week, S.day);
@@ -235,7 +263,7 @@ function renderTimeline() {
     }).join('');
     return `<section class="warehouse-timeline"><h3><span class="warehouse-badge">${warehouse === 'Warehouse 1' ? 'WH1' : 'WH2'}</span>${h(warehouse)}</h3><div class="timeline-row timeline-axis-row"><span class="timeline-name">${shortDate(date, { weekday: 'long' })}</span>${axis}</div>${sections}</section>`;
   }).join('');
-  return tabs + controls + '<p class="coverage-help">Numbers show available colleagues after timed breaks. Hatched sections are breaks. A ? means break times are still needed; cover is unconfirmed. Name search filters the individual rows, while coverage counts include the full department. Click a colleague’s bar to change their shift or break.</p>' + `<div class="timeline-scroll">${groups}</div>`;
+  return tabs + controls + '<p class="coverage-help">Numbers show planned cover after timed breaks. Attendance is recorded separately in Day view. Hatched sections are breaks. A ? means break times are still needed; cover is unconfirmed. Name search filters the individual rows, while coverage counts include the full department. Click a colleague’s bar to change their shift or break.</p>' + `<div class="timeline-scroll">${groups}</div>`;
 }
 function render() {
   const data = S.data; if (!data) return;
@@ -251,7 +279,7 @@ function render() {
   <div class="filter-toolbar"><div class="filters"><label class="search-field">${icon('search')}<span class="sr-only">Find a colleague</span><input id="colleague-search" type="search" value="${h(S.query)}" placeholder="${readOnly ? 'Find your name…' : 'Find a colleague…'}" autocomplete="off"></label><label><span class="sr-only">Department</span><select id="team-filter"><option value="">All departments</option>${choices(departments, S.team)}</select></label><label><span class="sr-only">Warehouse</span><select id="warehouse-filter"><option value="">Both warehouses</option>${choices(warehouses, S.warehouse)}</select></label><div class="view-toggle" aria-label="Rota view"><button data-action="view-week" class="${S.view === 'week' ? 'active' : ''}" aria-pressed="${S.view === 'week'}">Week</button><button data-action="view-day" class="${S.view === 'day' ? 'active' : ''}" aria-pressed="${S.view === 'day'}">Day</button>${!readOnly ? `<button data-action="view-timeline" class="${S.view === 'timeline' ? 'active' : ''}" aria-pressed="${S.view === 'timeline'}">Timeline</button>` : ''}</div></div>${!readOnly ? `<div class="edit-actions"><button class="button" data-action="copy">${icon('copy')}<span>Copy last week</span></button><button class="button dark" data-action="assign">${icon('plus')}<span>Assign shifts</span></button></div>` : '<button class="button" data-action="pdf">Download PDF</button><button class="button" data-action="print">Print rota</button>'}</div>
   ${!readOnly && S.selected.size ? `<div class="selection-bar"><strong>${S.selected.size} colleague${S.selected.size === 1 ? '' : 's'} selected</strong><button class="button compact" data-action="assign">Assign shifts</button><button class="text-button" data-action="clear-selection">Clear selection</button></div>` : ''}
   ${readOnly && data.unpublished ? `<div class="empty-state"><span class="empty-icon">${icon('calendar')}</span><h2>This week hasn’t been published yet</h2><p>Select a published week above or check again later.</p></div>` : `<div id="rota-content">${rotaContent()}</div>`}
-  <footer class="panel-footer"><div class="legend"><span><i class="legend-picking"></i>Picking</span><span><i class="legend-engraving"></i>Engraving</span><span><i class="legend-packing"></i>Packing</span><span><i class="legend-holiday"></i>Holiday</span><span><i class="legend-unavailable"></i>Unavailable</span></div><span>${readOnly && data.published_at ? `Updated ${h(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(data.published_at)))}` : !readOnly ? 'Private draft edits appear to colleagues after publishing.' : ''}</span></footer></section><div class="workspace-footer"><span>WH1 = Warehouse 1 · WH2 = Warehouse 2. UK local time. Breaks are unpaid. +1 means next-day finish.</span>${!readOnly ? `<div><a class="text-button" href="/api/export.csv?locationId=${encodeURIComponent(S.locationId)}&week=${S.week}">Export CSV</a><button class="text-button" data-action="pdf">Share PDF</button><button class="text-button" data-action="print">Print</button><button class="text-button" data-action="logout">Sign out</button></div>` : '<a class="text-button" href="/">Manager sign in</a>'}</div></main>`;
+  <footer class="panel-footer"><div class="legend"><span><i class="legend-picking"></i>Picking</span><span><i class="legend-engraving"></i>Engraving</span><span><i class="legend-packing"></i>Packing</span><span><i class="legend-holiday"></i>Holiday</span>${!readOnly ? '<span><i class="legend-sick"></i>Sick</span>' : ''}<span><i class="legend-unavailable"></i>Unavailable</span></div><span>${readOnly && data.published_at ? `Updated ${h(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(data.published_at)))}` : !readOnly ? 'Private draft edits appear to colleagues after publishing.' : ''}</span></footer></section><div class="workspace-footer"><span>WH1 = Warehouse 1 · WH2 = Warehouse 2. UK local time. Breaks are unpaid. +1 means next-day finish.</span>${!readOnly ? `<div><a class="text-button" href="/api/export.csv?locationId=${encodeURIComponent(S.locationId)}&week=${S.week}">Export CSV</a><button class="text-button" data-action="pdf">Share PDF</button><button class="text-button" data-action="print">Print</button><button class="text-button" data-action="logout">Sign out</button></div>` : '<a class="text-button" href="/">Manager sign in</a>'}</div></main>`;
   $('colleague-search').oninput = event => {
     S.query = event.target.value;
     if (S.view === 'timeline') { const position = event.target.selectionStart; render(); $('colleague-search').focus(); $('colleague-search').setSelectionRange(position, position); }
@@ -287,8 +315,10 @@ const cancel = '<button class="button" type="button" data-action="close-modal">C
 function patternOptions(selected = '') {
   return `<option value="">Manual shift</option>${S.data.templates.map(t => `<option value="${h(t.id)}" ${t.id === selected ? 'selected' : ''}>${h(t.name)} · ${h(t.start_time)}–${h(t.end_time)}</option>`).join('')}`;
 }
-function fieldsHTML(shift = {}) {
-  return `<div class="field-row"><label>Shift type<select id="shift-kind">${Object.entries(kindNames).map(([k, v]) => `<option value="${k}" ${(shift.kind || 'work') === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label><label>Shift name<input id="shift-label" maxlength="60" value="${h(shift.label || 'Shift')}" required></label></div><div id="working-fields"><div class="field-row three"><label>Start<input id="shift-start" type="time" value="${h(shift.start_time || '')}" required></label><label>Finish<input id="shift-end" type="time" value="${h(shift.end_time || '')}" required></label><label>Unpaid break (mins)<input id="shift-break" type="number" min="0" max="240" step="1" value="${shift.break_minutes || 0}" required></label></div><label>Break starts <span class="optional">optional - needed to confirm cover</span><input id="shift-break-start" type="time" value="${h(shift.break_start || '')}"></label><p class="field-help" id="shift-duration">Choose times or select a shift pattern.</p><label>Colour<select id="shift-colour">${['blue', 'teal', 'violet', 'amber'].map(c => `<option value="${c}" ${(shift.colour || 'blue') === c ? 'selected' : ''}>${c[0].toUpperCase() + c.slice(1)}</option>`).join('')}</select></label></div><label>Manager note <span class="optional">optional · hidden from colleagues</span><textarea id="shift-note" rows="2" maxlength="500">${h(shift.note || '')}</textarea></label>`;
+function fieldsHTML(shift = {}, assignmentFields = '') {
+  const assigning = Boolean(assignmentFields);
+  const nameField = `<label>${assigning ? 'Shift name (optional)' : 'Pattern name'}<input id="shift-label" maxlength="60" value="${h(shift.label || 'Shift')}" ${assigning ? '' : 'required'}></label>`;
+  return `<div class="field-row"><label>Type<select id="shift-kind">${Object.entries(kindNames).map(([k, v]) => `<option value="${k}" ${(shift.kind || 'work') === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>${assigning ? `<label>Pattern<select id="shift-pattern">${patternOptions()}</select></label>` : nameField}</div>${assignmentFields}<div id="working-fields"><div class="field-row"><label>Start<input id="shift-start" type="time" value="${h(shift.start_time || '')}" required></label><label>Finish<input id="shift-end" type="time" value="${h(shift.end_time || '')}" required></label></div><div class="field-row"><label>Break starts<input id="shift-break-start" type="time" value="${h(shift.break_start || '')}"></label><label>Unpaid break (mins)<input id="shift-break" type="number" min="0" max="240" step="1" value="${shift.break_minutes || 0}" required></label></div><p class="field-help" id="shift-duration">Choose times or select a pattern.</p></div><p class="field-help" id="sick-help" hidden>Sick is shown as Unavailable on the shared rota and PDFs.</p><details class="shift-more"><summary>More details</summary>${assigning ? nameField : ''}<label>Colour<select id="shift-colour">${['blue', 'teal', 'violet', 'amber'].map(c => `<option value="${c}" ${(shift.colour || 'blue') === c ? 'selected' : ''}>${c[0].toUpperCase() + c.slice(1)}</option>`).join('')}</select></label><label>Manager note <span class="optional">private</span><textarea id="shift-note" rows="2" maxlength="500">${h(shift.note || '')}</textarea></label></details>`;
 }
 function readShiftFields() {
   return { kind: $('shift-kind').value, label: $('shift-label').value, start_time: $('shift-start').value, end_time: $('shift-end').value, break_minutes: Number($('shift-break').value), break_start: $('shift-break-start').value || null, colour: $('shift-colour').value, note: $('shift-note').value, ...($('shift-department') ? { department: $('shift-department').value || ($('shift-person') ? '' : undefined), warehouse: $('shift-warehouse').value } : {}) };
@@ -297,6 +327,8 @@ function wireShiftFields() {
   function update() {
     const working = ['work', 'training'].includes($('shift-kind').value);
     $('working-fields').hidden = !working;
+    $('sick-help').hidden = $('shift-kind').value !== 'sick';
+    if ($('shift-pattern')) $('shift-pattern').disabled = !working;
     $('shift-break-start').disabled = !working || Number($('shift-break').value) === 0;
     if (!working || Number($('shift-break').value) === 0) $('shift-break-start').value = '';
     if ($('shift-department')) $('shift-colour').closest('label').hidden = true;
@@ -314,8 +346,8 @@ function wireShiftFields() {
   }
   $('shift-kind').onchange = () => {
     const kind = $('shift-kind').value;
-    if (['holiday', 'unavailable'].includes(kind)) $('shift-label').value = kindNames[kind];
-    else if (['Holiday', 'Unavailable'].includes($('shift-label').value)) $('shift-label').value = 'Shift';
+    if (['holiday', 'sick', 'unavailable'].includes(kind)) $('shift-label').value = kindNames[kind];
+    else if (['Holiday', 'Sick', 'Unavailable'].includes($('shift-label').value)) $('shift-label').value = 'Shift';
     update();
   };
   for (const id of ['shift-start', 'shift-end', 'shift-break', 'shift-break-start']) $(id).oninput = update;
@@ -338,8 +370,9 @@ function openAssign({ personIds = [...S.selected], dates = [], shift = null } = 
   if (shift) { personIds = [shift.person_id]; dates = [shift.date]; }
   const body = single ? `<div class="field-row"><label>Colleague<select id="shift-person">${people.map(p => `<option value="${h(p.id)}" ${personIds.includes(p.id) ? 'selected' : ''}>${h(p.name)}</option>`).join('')}</select></label><label>Date<input type="date" id="shift-date" value="${dates[0]}" required min="2020-01-01" max="2100-12-31"></label></div>` : `<div class="assign-layout"><section><div class="section-label"><strong>Colleagues</strong><label class="check-label"><input id="bulk-all" type="checkbox">Select all</label></div><input id="bulk-search" type="search" placeholder="Find a colleague…" aria-label="Find colleagues to assign"><div class="people-checklist">${people.map(p => `<label class="person-check" data-name="${h(p.name.toLocaleLowerCase())}"><input type="checkbox" name="person_ids" value="${h(p.id)}" ${personIds.includes(p.id) ? 'checked' : ''}><span><strong>${h(p.name)}</strong><small>${h(departmentName(p))}</small></span></label>`).join('')}</div><p class="field-help" id="bulk-count"></p></section><section><strong class="section-label">Days this week</strong><div class="days-checklist">${days.map((d, i) => { const date = plusDays(S.week, i); return `<label class="check-label"><input type="checkbox" name="dates" value="${date}" ${dates.length ? dates.includes(date) ? 'checked' : '' : i < 5 ? 'checked' : ''}><span>${d}</span><small>${shortDate(date)}</small></label>`; }).join('')}</div></section></div>`;
   const department = shift?.department ?? (single ? defaultDepartment(people.find(p => p.id === personIds[0])) : '');
-  const assignmentFields = `<div id="assignment-fields"><div class="field-row"><label>Department<select id="shift-department"><option value="">${single ? 'Choose department' : 'Use each colleague’s default'}</option>${choices(departments, department)}</select></label><label>Warehouse<select id="shift-warehouse"><option value="">Choose warehouse</option>${choices(warehouses, shift?.warehouse ?? S.warehouse)}</select></label></div><p class="field-help">${single ? 'The colleague’s default department is preselected. Change it for this shift if needed.' : 'Use each colleague’s default department, or choose one department for all selected colleagues.'} Choose the warehouse for these shifts.</p></div>`;
-  modal(shift ? 'Edit shift' : single ? 'Add shift' : 'Assign shifts', `${body}<label>Shift pattern<select id="shift-pattern">${patternOptions()}</select></label>${!S.data.templates.length ? '<p class="field-help">Enter a manual shift here. Save your usual patterns under “Shift patterns”.</p>' : '<p class="field-help">Select a pattern, then adjust times if needed.</p>'}${assignmentFields}${fieldsHTML(shift || {})}`, `${shift ? '<button type="button" class="button danger" id="remove-shift">Remove shift</button><span class="footer-spacer"></span>' : ''}${cancel}<button class="button primary" type="submit">${shift ? 'Save changes' : 'Assign shifts'}</button>`, !single);
+  const assignmentFields = `<div id="assignment-fields"><div class="field-row"><label>Department<select id="shift-department"><option value="">${single ? 'Choose department' : 'Use each colleague’s default'}</option>${choices(departments, department)}</select></label><label>Warehouse<select id="shift-warehouse"><option value="">Choose warehouse</option>${choices(warehouses, shift?.warehouse ?? S.warehouse)}</select></label></div></div>`;
+  modal(shift ? 'Edit shift' : single ? 'Add shift' : 'Assign shifts', `${body}${fieldsHTML(shift || {}, assignmentFields)}`, `${shift ? '<button type="button" class="button danger" id="remove-shift">Remove shift</button><span class="footer-spacer"></span>' : ''}${cancel}<button class="button primary" type="submit">${shift ? 'Save changes' : 'Assign shifts'}</button>`, !single);
+  $('modal').classList.add('shift-dialog');
   wireShiftFields();
   if (single) $('shift-person').onchange = event => { $('shift-department').value = defaultDepartment(people.find(p => p.id === event.target.value)); };
   if (!single) {
@@ -470,7 +503,7 @@ function openPDF() {
 }
 function deletePerson(id) {
   const p = S.data.people.find(p => p.id === id); if (!p || readOnly) return;
-  modal('Delete colleague?', `<p>Delete <strong>${h(p.name)}</strong>?</p><p>The colleague and all their saved draft shifts across every week will be removed.</p><p class="field-help">Published rota copies stay unchanged. Republish affected weeks when you want colleagues to see the change. You can archive the colleague instead by clearing Active colleague in their edit form.</p>`, '<button type="button" class="button" id="cancel-delete-person">Cancel</button><button type="submit" class="button danger">Delete colleague</button>');
+  modal('Delete colleague?', `<p>Delete <strong>${h(p.name)}</strong>?</p><p>The colleague, their attendance records and all their saved draft shifts across every week will be removed.</p><p class="field-help">Published rota copies stay unchanged. Republish affected weeks when you want colleagues to see the change. You can archive the colleague instead by clearing Active colleague in their edit form.</p>`, '<button type="button" class="button" id="cancel-delete-person">Cancel</button><button type="submit" class="button danger">Delete colleague</button>');
   $('cancel-delete-person').onclick = () => openProfile(id);
   $('dialog-form').onsubmit = event => {
     event.preventDefault();
@@ -606,22 +639,65 @@ function editLocation(id) {
   $('back-locations').onclick = openLocations;
   $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { await mutate(id ? `/api/locations/${id}` : '/api/locations', { name: $('location-name').value, active: $('location-active') ? $('location-active').checked : true }, id ? 'PUT' : 'POST'); openLocations(); toast('Location saved.'); }); };
 }
+let draggedShiftId = '', dropElement = null, ignoreShiftClickUntil = 0;
+function clearDrag() {
+  document.querySelector('.shift-dragging')?.classList.remove('shift-dragging');
+  dropElement?.classList.remove('shift-drop-target'); dropElement = null;
+  document.body.classList.remove('dragging-shift'); draggedShiftId = '';
+}
+document.addEventListener('dragstart', event => {
+  const card = event.target.closest('.shift-card[data-id]');
+  if (!card || readOnly || S.loading || S.saving) { if (card) event.preventDefault(); return; }
+  draggedShiftId = card.dataset.id;
+  event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', draggedShiftId);
+  card.classList.add('shift-dragging'); document.body.classList.add('dragging-shift');
+});
+document.addEventListener('dragover', event => {
+  if (!draggedShiftId || readOnly || S.loading || S.saving) return;
+  const target = event.target.closest('[data-drop-date]');
+  if (dropElement !== target) { dropElement?.classList.remove('shift-drop-target'); dropElement = target; }
+  if (target) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; target.classList.add('shift-drop-target'); }
+});
+document.addEventListener('drop', async event => {
+  const target = event.target.closest('[data-drop-date]');
+  if (!draggedShiftId || !target || readOnly || S.loading || S.saving) return;
+  event.preventDefault();
+  const shift = S.data.shifts.find(s => s.id === draggedShiftId);
+  const personId = target.dataset.dropPerson || shift?.person_id, date = target.dataset.dropDate;
+  clearDrag(); ignoreShiftClickUntil = Date.now() + 400;
+  if (!shift || shift.person_id === personId && shift.date === date) return;
+  const scroll = document.querySelector('.rota-scroll'), top = scroll?.scrollTop || 0, left = scroll?.scrollLeft || 0;
+  try {
+    await mutate(`/api/shifts/${shift.id}`, { ...shift, person_id: personId, date, location_id: S.locationId }, 'PUT');
+    const next = document.querySelector('.rota-scroll'); if (next) { next.scrollTop = top; next.scrollLeft = left; }
+    toast(`Shift moved to ${shortDate(date, { weekday: 'short' })}. Publish the week when ready.`);
+  } catch (error) { toast(error.message, true); }
+});
+document.addEventListener('dragend', () => { clearDrag(); ignoreShiftClickUntil = Date.now() + 400; });
 document.addEventListener('click', async event => {
   const button = event.target.closest('[data-action]'); if (!button || button.disabled) return;
   const action = button.dataset.action;
-  if (S.loading && !['retry', 'close-modal', 'previous', 'next', 'today'].includes(action)) return;
+  if ((S.loading || S.saving) && !['retry', 'close-modal', 'previous', 'next', 'today'].includes(action)) return;
+  if (action === 'edit-shift' && Date.now() < ignoreShiftClickUntil) return;
   try {
     if (action === 'retry') return load();
     if (action === 'close-modal') return closeDialog();
     if (action === 'previous') return changeWeek(plusDays(S.week, -7));
     if (action === 'next') return changeWeek(plusDays(S.week, 7));
     if (action === 'today') return changeWeek(monday(londonToday()));
-    if (action === 'day') { S.day = Number(button.dataset.day); render(); return; }
+    if (action === 'day') { const day = Number(button.dataset.day); if (!Number.isInteger(day) || day < 0 || day > 6) return; S.day = day; S.dayWeek = S.week; render(); return; }
     if (action === 'coverage-full' && !readOnly) { S.coverageFull = !S.coverageFull; render(); return; }
     if (action === 'view-day' || action === 'view-week' || (!readOnly && action === 'view-timeline')) { S.view = action.slice(5); store('rota-view', S.view); render(); return; }
     if (action === 'print') return window.print();
     if (action === 'pdf') return openPDF();
     if (readOnly) return;
+    if (action === 'day-hours') return openDayHours(button.dataset.date);
+    if (action === 'attendance') {
+      button.disabled = true;
+      try { await mutate('/api/attendance', { person_id: button.dataset.person, location_id: S.locationId, date: button.dataset.date, status: button.dataset.status }); toast(button.dataset.status === 'unmarked' ? 'Attendance cleared.' : button.dataset.status === 'checked_in' ? 'Colleague checked in.' : 'Colleague marked as no show.'); }
+      finally { button.disabled = false; }
+      return;
+    }
     if (action === 'profile') return openProfile(button.dataset.person);
     if (action === 'team') return openTeam();
     if (action === 'patterns') return openPatterns();

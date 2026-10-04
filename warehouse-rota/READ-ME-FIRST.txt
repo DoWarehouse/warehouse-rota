@@ -1,0 +1,41 @@
+ROTA UPDATE — 4 OCTOBER 2026
+
+This package contains the tested shift dragging, attendance, Sick, day layout and daily hours update.
+The live page checked today was still requesting compact-weekly-performance-20261003.
+The correct new page marker is rota-daily-tools-20261004.
+
+UPLOAD ALL FIVE FILES IN ONE COMMIT
+
+1. Extract this ZIP.
+2. In GitHub, open DoWarehouse/warehouse-rota, select main, and open the ORIGINAL warehouse-rota folder that Render uses.
+3. Choose Add file -> Upload files.
+4. From the extracted package, drag these THREE ITEMS together into the upload area:
+   server.mjs
+   public (folder)
+   lib (folder)
+   Drag the items INSIDE the extracted folder. Do not drag the outer extracted folder or the ZIP.
+5. Before committing, check that the upload list shows these FIVE paths:
+   server.mjs
+   public/index.html
+   public/app.js
+   public/styles.css
+   lib/dashboard.mjs
+   None should include a numbered folder, an extra public/public folder, or an outer rota-update folder.
+6. Commit all five replacements to main together.
+7. In Render, open dylan-oaks-warehouse-rota and select Manual Deploy -> Deploy latest commit.
+8. Wait for that new deployment to finish and show Live. Refresh the manager rota and select Day.
+
+WHAT TO LOOK FOR
+
+Day should show the selected date above the full-width list, Set day hours, Scheduled/Required/Budget totals,
+and Check in/No show controls beside colleagues with work or training. Attendance is available on the shift date or afterwards.
+Sick should appear in the shift Type menu and manager legend. Desktop shifts can be dragged to another colleague or day.
+
+Keep the existing disk, DATA_DIR, password and dashboard integration settings.
+The code preserves saved colleagues, shifts, dashboard settings, publications and the QR code.
+Schema 4 adds separate attendance and target tables and backs up an existing populated database first.
+No dashboard service changes are required.
+
+If the old layout remains: in the original GitHub warehouse-rota/public/index.html, check that rota-daily-tools-20261004 appears.
+If that file is current but Render still serves the older version, check the linked branch, Root Directory and deployed commit.
+For the original nested project, Root Directory is warehouse-rota, build is npm ci, and start is npm start.

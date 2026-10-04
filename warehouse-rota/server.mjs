@@ -12,7 +12,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
 const uuid = () => randomUUID();
-const KINDS = ['work', 'training', 'holiday', 'unavailable'];
+const KINDS = ['work', 'training', 'holiday', 'sick', 'unavailable'];
 const COLOURS = ['blue', 'teal', 'violet', 'amber'];
 const DEPARTMENTS = ['Picking', 'Engraving', 'Packing'];
 const WAREHOUSES = ['Warehouse 1', 'Warehouse 2'];
@@ -99,7 +99,7 @@ function shiftFields(body) {
   }
   return {
     kind, start_time, end_time, break_minutes, break_start,
-    label: textValue(body.label || (kind === 'holiday' ? 'Holiday' : kind === 'unavailable' ? 'Unavailable' : 'Shift'), 'Shift name', 60),
+    label: textValue(body.label || ({ holiday: 'Holiday', sick: 'Sick', unavailable: 'Unavailable' })[kind] || 'Shift', 'Shift name', 60),
     colour: COLOURS.includes(body.colour) ? body.colour : 'blue',
     note: textValue(body.note || '', 'Manager note', 500, true)
   };
@@ -150,7 +150,7 @@ export function createRotaServer(options = {}) {
     CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, password_fingerprint TEXT NOT NULL);
   `);
   const schemaVersion = Number(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value);
-  requireThat(schemaVersion <= 3, 'This database needs a newer version of the rota app.', 500);
+  requireThat(schemaVersion <= 4, 'This database needs a newer version of the rota app.', 500);
   if (schemaVersion < 2) {
     // Keep the original assignments and QR tokens. Old warehouse assignments
     // stay unset until a manager chooses them; never guess where someone works.
@@ -182,6 +182,28 @@ export function createRotaServer(options = {}) {
       ALTER TABLE people ADD COLUMN leaderboard_name TEXT NOT NULL DEFAULT '';
       ALTER TABLE people ADD COLUMN is_example INTEGER NOT NULL DEFAULT 0;
       UPDATE meta SET value = '3' WHERE key = 'schema_version';
+      UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
+      COMMIT;`);
+  }
+  if (schemaVersion < 4) {
+    if (db.prepare('SELECT COUNT(*) AS n FROM people').get().n > 0) {
+      const dir = path.join(dataDir, 'backups'); fs.mkdirSync(dir, { recursive: true });
+      const destination = path.join(dir, 'rota-before-schema-4.sqlite');
+      if (!fs.existsSync(destination)) db.prepare('VACUUM INTO ?').run(destination);
+    }
+    db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE attendance (
+        person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        location_id TEXT NOT NULL REFERENCES locations(id), date TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('checked_in', 'no_show')), marked_at TEXT NOT NULL,
+        PRIMARY KEY (person_id, location_id, date)
+      );
+      CREATE TABLE day_plans (
+        location_id TEXT NOT NULL REFERENCES locations(id), date TEXT NOT NULL,
+        budget_minutes INTEGER CHECK(budget_minutes >= 0), requirement_minutes INTEGER CHECK(requirement_minutes >= 0),
+        PRIMARY KEY (location_id, date)
+      );
+      UPDATE meta SET value = '4' WHERE key = 'schema_version';
       UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
       COMMIT;`);
   }
@@ -227,7 +249,8 @@ export function createRotaServer(options = {}) {
     return {
       location: { id: loc.id, name: loc.name }, week, people,
       departments: DEPARTMENTS, warehouses: WAREHOUSES,
-      shifts: shifts.map(({ note, ...shift }) => shift)
+      // Absence reasons and daily manager records do not go on the shared rota.
+      shifts: shifts.map(({ note, ...shift }) => shift.kind === 'sick' ? { ...shift, kind: 'unavailable', label: 'Unavailable' } : shift)
     };
   }
   function state(week) {
@@ -236,13 +259,15 @@ export function createRotaServer(options = {}) {
       dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
     }));
     return {
-      revision: revision(), week, demo, build: 'compact-weekly-performance-20261003', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      revision: revision(), week, demo, build: 'rota-daily-tools-20261004', departments: DEPARTMENTS, warehouses: WAREHOUSES,
       previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
       dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
       locations: db.prepare('SELECT id, name, share_token, active FROM locations ORDER BY active DESC, name COLLATE NOCASE').all(),
       people: db.prepare('SELECT * FROM people ORDER BY team COLLATE NOCASE, row_order, name COLLATE NOCASE, id').all(),
       templates: db.prepare('SELECT * FROM templates ORDER BY name COLLATE NOCASE').all(),
       shifts: db.prepare('SELECT * FROM shifts WHERE date BETWEEN ? AND ? ORDER BY date, start_time, id').all(week, addDays(week, 6)),
+      attendance: db.prepare('SELECT * FROM attendance WHERE date BETWEEN ? AND ? ORDER BY date, person_id').all(week, addDays(week, 6)),
+      dayPlans: db.prepare('SELECT * FROM day_plans WHERE date BETWEEN ? AND ? ORDER BY date, location_id').all(week, addDays(week, 6)),
       publications
     };
   }
@@ -460,9 +485,10 @@ export function createRotaServer(options = {}) {
           const loc = location(url.searchParams.get('locationId'));
           const week = weekValue(url.searchParams.get('week'));
           const snap = snapshot(loc.id, week);
+          const draftShifts = db.prepare('SELECT * FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ? ORDER BY date, person_id, start_time, id').all(loc.id, week, addDays(week, 6));
           const names = new Map(snap.people.map(p => [p.id, p]));
           const rows = [['Name', 'Default department', 'Department', 'Warehouse', 'Date', 'Shift', 'Start', 'Finish', 'Break starts', 'Unpaid break minutes', 'Scheduled hours', 'Type']];
-          for (const s of snap.shifts) rows.push([names.get(s.person_id).name, names.get(s.person_id).default_department, s.department, s.warehouse, s.date, s.label, s.start_time || '', s.end_time || '', s.break_start || '', s.break_minutes, (scheduledMinutes(s) / 60).toFixed(2), s.kind]);
+          for (const s of draftShifts) rows.push([names.get(s.person_id).name, names.get(s.person_id).default_department, s.department, s.warehouse, s.date, s.label, s.start_time || '', s.end_time || '', s.break_start || '', s.break_minutes, (scheduledMinutes(s) / 60).toFixed(2), s.kind]);
           res.setHeader('Content-Disposition', `attachment; filename="rota-${week}.csv"`);
           return send(res, 200, '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n'), 'text/csv; charset=utf-8');
         }
@@ -479,6 +505,32 @@ export function createRotaServer(options = {}) {
         csrf(req);
         const body = await readBody(req);
         const result = mutation(req, () => {
+          if (method === 'POST' && pathname === '/api/attendance') {
+            const p = person(body.person_id), loc = location(body.location_id), date = dateValue(body.date);
+            requireThat(['checked_in', 'no_show', 'unmarked'].includes(body.status), 'Choose checked in, no show or clear attendance.');
+            requireThat(date <= today(), 'Attendance can be marked on the shift date or afterwards.');
+            if (body.status === 'unmarked') {
+              db.prepare('DELETE FROM attendance WHERE person_id = ? AND location_id = ? AND date = ?').run(p.id, loc.id, date);
+              return { cleared: true };
+            }
+            requireThat(db.prepare("SELECT id FROM shifts WHERE person_id = ? AND location_id = ? AND date = ? AND kind IN ('work', 'training') LIMIT 1").get(p.id, loc.id, date), 'Attendance needs a work or training shift on this day.');
+            const marked_at = new Date().toISOString();
+            db.prepare('INSERT INTO attendance VALUES (?, ?, ?, ?, ?) ON CONFLICT(person_id, location_id, date) DO UPDATE SET status = excluded.status, marked_at = excluded.marked_at').run(p.id, loc.id, date, body.status, marked_at);
+            return { status: body.status, marked_at };
+          }
+          if (method === 'POST' && pathname === '/api/day-plans') {
+            const loc = location(body.location_id), date = dateValue(body.date);
+            requireThat(loc.active, 'Reactivate this location before setting daily hours.');
+            const toMinutes = (value, name) => {
+              if (value === null || value === undefined || value === '') return null;
+              requireThat((typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10000, `${name} must be hours between 0 and 10,000, or left blank.`);
+              return Math.round(Number(value) * 60);
+            };
+            const budget = toMinutes(body.budget_hours, 'Budget'), required = toMinutes(body.requirement_hours, 'Requirement');
+            if (budget === null && required === null) db.prepare('DELETE FROM day_plans WHERE location_id = ? AND date = ?').run(loc.id, date);
+            else db.prepare('INSERT INTO day_plans VALUES (?, ?, ?, ?) ON CONFLICT(location_id, date) DO UPDATE SET budget_minutes = excluded.budget_minutes, requirement_minutes = excluded.requirement_minutes').run(loc.id, date, budget, required);
+            return { saved: true };
+          }
           if (method === 'POST' && pathname === '/api/dashboard/settings') {
             let value;
             try { value = dashboard.validateURL(body.url || ''); } catch (error) { throw new Problem(400, error.message); }
