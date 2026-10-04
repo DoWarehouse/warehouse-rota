@@ -259,8 +259,9 @@ export function createRotaServer(options = {}) {
       dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
     }));
     return {
-      revision: revision(), week, demo, build: 'rota-week-controls-20261004', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      revision: revision(), week, demo, build: 'rota-no-show-hours-20261004', departments: DEPARTMENTS, warehouses: WAREHOUSES,
       previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
+      previousAttendance: db.prepare('SELECT * FROM attendance WHERE date = ? ORDER BY person_id').all(addDays(week, -1)),
       dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
       locations: db.prepare('SELECT id, name, share_token, active FROM locations ORDER BY active DESC, name COLLATE NOCASE').all(),
       people: db.prepare('SELECT * FROM people ORDER BY team COLLATE NOCASE, row_order, name COLLATE NOCASE, id').all(),

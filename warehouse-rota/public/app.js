@@ -149,9 +149,9 @@ function visiblePeople() {
     .sort((a, b) => (departments.indexOf(defaultDepartment(a)) + 1 || 4) - (departments.indexOf(defaultDepartment(b)) + 1 || 4) || a.row_order - b.row_order || a.name.localeCompare(b.name));
 }
 function publication() { return readOnly ? null : S.data.publications.find(p => p.location_id === S.locationId); }
-function personHours(personId) { return S.data.shifts.filter(s => s.person_id === personId).reduce((sum, s) => sum + minutes(s), 0); }
+function personHours(personId) { return S.data.shifts.filter(s => s.person_id === personId).reduce((sum, s) => sum + rotaMinutes(s), 0); }
 function dayMetrics(date) {
-  const shifts = locationShifts().filter(s => s.date === date && ['work', 'training'].includes(s.kind));
+  const shifts = locationShifts().filter(s => s.date === date && ['work', 'training'].includes(s.kind) && !isNoShow(s));
   return { count: new Set(shifts.map(s => s.person_id)).size, minutes: shifts.reduce((sum, s) => sum + minutes(s), 0) };
 }
 function renderLogin() {
@@ -164,12 +164,16 @@ function renderLogin() {
     finally { button.disabled = false; }
   };
 }
-function attendanceRecord(personId, date) {
-  return (S.data.attendance || []).find(a => a.person_id === personId && a.location_id === S.locationId && a.date === date);
+function attendanceRecord(personId, date, locationId = S.locationId) {
+  return [...(S.data.attendance || []), ...(S.data.previousAttendance || [])].find(a => a.person_id === personId && a.location_id === locationId && a.date === date);
 }
+function isNoShow(shift) {
+  return !readOnly && attendanceRecord(shift.person_id, shift.date, shift.location_id)?.status === 'no_show';
+}
+function rotaMinutes(shift) { return isNoShow(shift) ? 0 : minutes(shift); }
 function shiftCard(shift, weekly = false) {
   const working = ['work', 'training'].includes(shift.kind);
-  const noShow = weekly === true && !readOnly && working && attendanceRecord(shift.person_id, shift.date)?.status === 'no_show';
+  const noShow = weekly === true && working && isNoShow(shift);
   const overnight = working && shift.end_time < shift.start_time;
   const detail = working ? `${hours(minutes(shift))}h${shift.break_minutes ? shift.break_start ? ` · Break ${shift.break_start}–${clockLabel(clockMinutes(shift.break_start) + shift.break_minutes)}` : ` · ${shift.break_minutes}m break (time unset)` : ''}` : 'All day';
   const assignment = [shift.department, shift.warehouse].filter(Boolean).join(' · ');
@@ -203,7 +207,7 @@ function renderGrid() {
       return `<td class="shift-cell ${date === londonToday() ? 'today-column' : ''} ${noShow ? 'no-show-cell' : ''}" ${!readOnly && p.active ? `data-drop-person="${h(p.id)}" data-drop-date="${date}"` : ''}>${entries.map(s => shiftCard(s, true)).join('')}${standalone ? `<span class="weekly-no-show standalone" title="Saved attendance record; no work shift on this day" aria-label="No show for ${h(p.name)} on ${shortDate(date)}">No show</span>` : ''}${!readOnly && p.active ? `<button class="cell-add ${entries.length || noShow ? 'small' : ''}" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)} on ${shortDate(date)}">${icon('plus')}</button>` : !entries.length && !noShow ? '<span class="off-day">—</span>' : ''}</td>`;
     }).join('');
     const initials = p.name.split(/\s+/).slice(0, 2).map(n => n[0]).join('');
-    return `${separator}<tr class="colleague-row">${!readOnly ? `<td class="check-cell"><input type="checkbox" data-select-person="${h(p.id)}" aria-label="Select ${h(p.name)}" ${S.selected.has(p.id) ? 'checked' : ''} ${p.active ? '' : 'disabled'}></td>` : ''}<th class="person-column" scope="row"><div class="person-name-row"><span class="avatar">${h(initials)}</span><span>${readOnly ? `<span class="person-name" title="${h(p.name)}">${h(p.name)}</span>` : `<button class="person-name profile-link" title="${h(p.name)}" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role" title="${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}">${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}</span></span></div></th>${cells}<td class="hours-column ${over ? 'over-hours' : ''}" title="${readOnly ? 'Scheduled hours' : 'Scheduled hours across all locations'}"><strong>${hours(total)}<small>h</small></strong>${!readOnly && p.contract_minutes > 0 ? `<span>of ${hours(p.contract_minutes)}h</span>` : ''}</td></tr>`;
+    return `${separator}<tr class="colleague-row">${!readOnly ? `<td class="check-cell"><input type="checkbox" data-select-person="${h(p.id)}" aria-label="Select ${h(p.name)}" ${S.selected.has(p.id) ? 'checked' : ''} ${p.active ? '' : 'disabled'}></td>` : ''}<th class="person-column" scope="row"><div class="person-name-row"><span class="avatar">${h(initials)}</span><span>${readOnly ? `<span class="person-name" title="${h(p.name)}">${h(p.name)}</span>` : `<button class="person-name profile-link" title="${h(p.name)}" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role" title="${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}">${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}</span></span></div></th>${cells}<td class="hours-column ${over ? 'over-hours' : ''}" title="${readOnly ? 'Scheduled hours' : 'Hours after unpaid breaks and no shows, across all locations'}"><strong>${hours(total)}<small>h</small></strong>${!readOnly && p.contract_minutes > 0 ? `<span>of ${hours(p.contract_minutes)}h</span>` : ''}</td></tr>`;
   }).join('');
   return `<div class="rota-scroll" tabindex="0" aria-label="Weekly rota; scroll to see all colleagues and days"><table class="rota-table ${readOnly ? 'read-only' : ''}"><thead><tr>${!readOnly ? `<th class="check-cell" scope="col"><input id="select-all" type="checkbox" aria-label="Select all visible colleagues" ${allSelected ? 'checked' : ''}></th>` : ''}<th class="person-column" scope="col">Colleague <span class="muted">${people.length}</span></th>${head}<th class="hours-column" scope="col">Hours</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
@@ -229,16 +233,17 @@ function attendanceControls(p, entries, date) {
 function dayPlanningHTML(date) {
   const plan = (S.data.dayPlans || []).find(p => p.location_id === S.locationId && p.date === date);
   const dayShifts = allLocationShifts().filter(s => s.date === date && ['work', 'training'].includes(s.kind));
-  const scheduled = dayShifts.reduce((total, s) => total + minutes(s), 0);
+  const scheduled = dayShifts.reduce((total, s) => total + rotaMinutes(s), 0);
   const required = plan?.requirement_minutes ?? null;
   const people = new Set(dayShifts.map(s => s.person_id));
+  const availablePeople = new Set(dayShifts.filter(s => !isNoShow(s)).map(s => s.person_id));
   const attendance = (S.data.attendance || []).filter(a => a.location_id === S.locationId && a.date === date && people.has(a.person_id));
   const checked = attendance.filter(a => a.status === 'checked_in').length, absent = attendance.filter(a => a.status === 'no_show').length;
-  return `<div class="day-planning"><div class="day-stat"><span>Scheduled</span><strong>${hours(scheduled)}<small>h</small></strong><small>${people.size} colleagues · after unpaid breaks</small></div><div class="day-stat ${required !== null && scheduled < required ? 'short' : ''}"><span>Required</span><strong>${required === null ? '—' : hours(required) + '<small>h</small>'}</strong><small>${required === null ? 'Set the hours you need' : scheduled < required ? `${hours(required - scheduled)}h short` : scheduled === required ? 'Requirement met' : `${hours(scheduled - required)}h above requirement`}</small></div></div><p class="day-scope">Hours cover ${h(currentLocation().name)}, both warehouses and all departments. Overnight hours count on the shift’s start date.${date <= londonToday() ? ` <span class="attendance-summary">${checked} checked in · ${absent} no show · ${people.size - checked - absent} unmarked</span>` : ' Attendance opens on the shift date.'}</p>`;
+  return `<div class="day-planning"><div class="day-stat"><span>Scheduled</span><strong>${hours(scheduled)}<small>h</small></strong><small>${availablePeople.size} colleagues · after unpaid breaks · excludes no shows</small></div><div class="day-stat ${required !== null && scheduled < required ? 'short' : ''}"><span>Required</span><strong>${required === null ? '—' : hours(required) + '<small>h</small>'}</strong><small>${required === null ? 'Set the hours you need' : scheduled < required ? `${hours(required - scheduled)}h short` : scheduled === required ? 'Requirement met' : `${hours(scheduled - required)}h above requirement`}</small></div></div><p class="day-scope">Hours cover ${h(currentLocation().name)}, both warehouses and all departments. Overnight hours count on the shift’s start date.${date <= londonToday() ? ` <span class="attendance-summary">${checked} checked in · ${absent} no show · ${people.size - checked - absent} unmarked</span>` : ' Attendance opens on the shift date.'}</p>`;
 }
 function openDayHours(date) {
   const plan = (S.data.dayPlans || []).find(p => p.location_id === S.locationId && p.date === date);
-  modal('Required hours', `<p>${h(shortDate(date, { weekday: 'long', year: 'numeric' }))} · ${h(currentLocation().name)}</p><label>Required hours<input id="day-required" type="number" min="0" max="10000" step="0.01" value="${plan?.requirement_minutes == null ? '' : Number((plan.requirement_minutes / 60).toFixed(2))}" placeholder="e.g. 320"></label><p class="field-help">Set the total hours needed for both warehouses and all departments at this location. Leave blank to remove the requirement. Scheduled hours exclude unpaid breaks and absences.</p>`, `${cancel}<button type="submit" class="button primary">Save hours</button>`);
+  modal('Required hours', `<p>${h(shortDate(date, { weekday: 'long', year: 'numeric' }))} · ${h(currentLocation().name)}</p><label>Required hours<input id="day-required" type="number" min="0" max="10000" step="0.01" value="${plan?.requirement_minutes == null ? '' : Number((plan.requirement_minutes / 60).toFixed(2))}" placeholder="e.g. 320"></label><p class="field-help">Set the total hours needed for both warehouses and all departments at this location. Leave blank to remove the requirement. Scheduled hours exclude unpaid breaks, absences and no shows.</p>`, `${cancel}<button type="submit" class="button primary">Save hours</button>`);
   $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { await mutate('/api/day-plans', { location_id: S.locationId, date, requirement_hours: $('day-required').value }); closeDialog(); toast('Required hours saved.'); }); };
 }
 function openClearRota(scope, date) {
@@ -263,7 +268,7 @@ function renderTimeline() {
   const tabs = `<div class="day-tabs">${days.map((d, i) => `<button class="day-tab ${i === S.day ? 'active' : ''}" data-action="day" data-day="${i}" aria-pressed="${i === S.day}"><span>${d}</span><strong>${shortDate(plusDays(S.week, i), { month: undefined })}</strong></button>`).join('')}</div>`;
   const controls = `<div class="coverage-controls"><label>Cover from<input id="coverage-start" type="time" value="${S.coverageStart}" ${S.coverageFull ? 'disabled' : ''}></label><label>Cover until<input id="coverage-end" type="time" value="${S.coverageEnd}" ${S.coverageFull ? 'disabled' : ''}></label><label>Minimum per department<input id="minimum-cover" type="number" min="0" max="100" value="${S.minimumCover}"></label><button class="button" data-action="coverage-full" aria-pressed="${Boolean(S.coverageFull)}">${S.coverageFull ? 'Use chosen hours' : 'Show 24 hours'}</button></div>`;
   if (!(end > start)) return tabs + controls + '<p class="coverage-help">Choose a finish after the start, or show 24 hours.</p>';
-  const shifts = [...(S.data.previousShifts || []), ...allLocationShifts()].filter(s => s.location_id === S.locationId);
+  const shifts = [...(S.data.previousShifts || []), ...allLocationShifts()].filter(s => s.location_id === S.locationId && !isNoShow(s));
   const x = value => Math.max(0, Math.min(1000, (value - start) / (end - start) * 1000));
   const axis = `<svg preserveAspectRatio="none" viewBox="0 0 1000 26" class="timeline-axis" aria-hidden="true">${Array.from({ length: Math.ceil((end - start) / 60) + 1 }, (_, i) => start + i * 60).filter(t => t <= end).map(t => `<text x="${x(t)}" y="18" text-anchor="${t === start ? 'start' : t === end ? 'end' : 'middle'}">${clockLabel(t)}</text>`).join('')}</svg>`;
   const groups = warehouses.filter(w => !S.warehouse || w === S.warehouse).map(warehouse => {
@@ -285,13 +290,13 @@ function renderTimeline() {
     }).join('');
     return `<section class="warehouse-timeline"><h3><span class="warehouse-badge">${warehouse === 'Warehouse 1' ? 'WH1' : 'WH2'}</span>${h(warehouse)}</h3><div class="timeline-row timeline-axis-row"><span class="timeline-name">${shortDate(date, { weekday: 'long' })}</span>${axis}</div>${sections}</section>`;
   }).join('');
-  return tabs + controls + '<p class="coverage-help">Numbers show planned cover after timed breaks. Attendance is recorded separately in Day view. Hatched sections are breaks. A ? means break times are still needed; cover is unconfirmed. Name search filters the individual rows, while coverage counts include the full department. Click a colleague’s bar to change their shift or break.</p>' + `<div class="timeline-scroll">${groups}</div>`;
+  return tabs + controls + '<p class="coverage-help">Numbers show cover after timed breaks, excluding colleagues marked No show in Day view. Hatched sections are breaks. A ? means break times are still needed; cover is unconfirmed. Name search filters the individual rows, while coverage counts include the full department. Click a colleague’s bar to change their shift or break.</p>' + `<div class="timeline-scroll">${groups}</div>`;
 }
 function render() {
   const data = S.data; if (!data) return;
   const loc = currentLocation(), people = visiblePeople(), shifts = locationShifts();
   const work = shifts.filter(s => ['work', 'training'].includes(s.kind));
-  const total = work.reduce((sum, s) => sum + minutes(s), 0);
+  const total = work.reduce((sum, s) => sum + rotaMinutes(s), 0);
   const pub = publication();
   const status = readOnly ? 'Published rota' : pub ? pub.dirty ? 'Changes to publish' : 'Published' : 'Private draft';
   const end = plusDays(S.week, 6);
@@ -476,7 +481,7 @@ function openProfile(id) {
   const shifts = allLocationShifts().filter(s => s.person_id === id);
   const previous = shifts.filter(finishedShift).sort((a, b) => b.date.localeCompare(a.date) || b.end_time.localeCompare(a.end_time));
   const selectedDate = previous[0]?.date || londonToday();
-  modal(p.name, `<div class="profile-summary"><span class="department-tag ${departmentColour[defaultDepartment(p)] || 'blue'}">${h(departmentName(p))}</span>${p.is_example ? '<span class="example-tag">Example colleague</span>' : ''}<p>${h(p.role || 'Warehouse colleague')} · ${hours(shifts.reduce((sum, shift) => sum + minutes(shift), 0))}h scheduled in this rota week</p></div><h3>Performance for this rota week</h3><p class="profile-week-range">${h(shortDate(profileWeek))} – ${h(shortDate(plusDays(profileWeek, 6)))} · ${h(currentLocation().name)}</p><div id="profile-week-performance" aria-live="polite"><p class="field-help">Reading this week’s recorded performance…</p></div><details class="profile-day-details" id="profile-day-details"><summary>Review one date</summary><label class="profile-date-control">Performance date<input id="profile-performance-date" type="date" min="2020-01-01" max="${londonToday()}" value="${selectedDate}"></label><div id="profile-performance" aria-live="polite"></div></details><h3>Shifts in this rota week</h3><div class="profile-shifts">${shifts.map(s => `<div><strong>${shortDate(s.date, { weekday: 'short' })}</strong>${shiftCard(s)}${finishedShift(s) ? `<button class="text-button profile-performance-button" type="button" data-performance-date="${s.date}">View day details</button>` : ''}</div>`).join('') || '<p class="field-help">No shifts assigned in this rota week. Use “Review one date” to view earlier performance.</p>'}</div>`, '<button type="button" class="button danger" id="delete-profile">Delete colleague</button><span class="footer-spacer"></span><button type="button" class="button" data-action="close-modal">Done</button><button type="button" class="button primary" id="edit-profile">Edit colleague</button>', true);
+  modal(p.name, `<div class="profile-summary"><span class="department-tag ${departmentColour[defaultDepartment(p)] || 'blue'}">${h(departmentName(p))}</span>${p.is_example ? '<span class="example-tag">Example colleague</span>' : ''}<p>${h(p.role || 'Warehouse colleague')} · ${hours(shifts.reduce((sum, shift) => sum + rotaMinutes(shift), 0))}h scheduled in this rota week</p></div><h3>Performance for this rota week</h3><p class="profile-week-range">${h(shortDate(profileWeek))} – ${h(shortDate(plusDays(profileWeek, 6)))} · ${h(currentLocation().name)}</p><div id="profile-week-performance" aria-live="polite"><p class="field-help">Reading this week’s recorded performance…</p></div><details class="profile-day-details" id="profile-day-details"><summary>Review one date</summary><label class="profile-date-control">Performance date<input id="profile-performance-date" type="date" min="2020-01-01" max="${londonToday()}" value="${selectedDate}"></label><div id="profile-performance" aria-live="polite"></div></details><h3>Shifts in this rota week</h3><div class="profile-shifts">${shifts.map(s => `<div><strong>${shortDate(s.date, { weekday: 'short' })}</strong>${shiftCard(s, true)}${finishedShift(s) ? `<button class="text-button profile-performance-button" type="button" data-performance-date="${s.date}">View day details</button>` : ''}</div>`).join('') || '<p class="field-help">No shifts assigned in this rota week. Use “Review one date” to view earlier performance.</p>'}</div>`, '<button type="button" class="button danger" id="delete-profile">Delete colleague</button><span class="footer-spacer"></span><button type="button" class="button" data-action="close-modal">Done</button><button type="button" class="button primary" id="edit-profile">Edit colleague</button>', true);
   $('modal').dataset.profileId = id; $('edit-profile').onclick = () => editPerson(id); $('delete-profile').onclick = () => deletePerson(id);
   $('dialog-form').onsubmit = event => event.preventDefault();
   const current = () => $('modal').open && $('modal').dataset.profileId === id && profileSession === profileSequence;
