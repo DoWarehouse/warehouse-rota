@@ -1,0 +1,41 @@
+# Rota update — 4 October 2026
+
+This package updates the existing GitHub/Render rota. It has been tested locally and has not been deployed by Codex.
+
+## Changes
+
+- No shows marked in Day view also appear as a red **No show** label in Week view. Times, department colours and WH1/WH2 stay visible, with compact rows. Correct or clear attendance in Day view to update the weekly label.
+- **Clear rota** clears the displayed Monday–Sunday draft week at the selected location.
+- **Clear day** in Day view clears the selected date’s draft shifts.
+- Both clear actions show the date, location and number of shifts before confirmation. They include both warehouses and all departments, including shifts hidden by filters. Work, training, holiday, sick and unavailable entries are all included. Overnight shifts are selected by their start date.
+- Colleagues, patterns, saved attendance and required hours remain saved. Other weeks and locations are preserved. Shared views and PDFs keep the earlier published copy until you publish the changes.
+- Budget hours have been removed. **Set required hours** is the only daily target; compare it with scheduled hours after unpaid breaks. An empty field removes the requirement; zero is a real requirement. Existing required hours remain saved.
+- Existing shift dragging, the simpler editor, full-width day layout, private Sick entries and weekly performance profiles are retained.
+
+Attendance and required hours stay private to managers. No-show marks record actual attendance without changing planned shifts or planned hours. If a shift is moved or cleared after marking attendance, its record stays attached to the original colleague/date.
+
+## Upload everything in one commit
+
+1. Extract **rota-week-controls-update.zip**.
+2. Open **DoWarehouse/warehouse-rota** on GitHub, branch **main**, and enter the original **warehouse-rota** folder.
+3. Select **Add file → Upload files**.
+4. Drag the three items **inside** the extracted folder into the upload area together: **server.mjs**, **public**, **lib**. Do not upload the ZIP or its outer folder.
+5. The upload must replace these five files inside the original GitHub project folder:
+
+| Package path | GitHub path |
+| --- | --- |
+| server.mjs | warehouse-rota/server.mjs |
+| public/index.html | warehouse-rota/public/index.html |
+| public/app.js | warehouse-rota/public/app.js |
+| public/styles.css | warehouse-rota/public/styles.css |
+| lib/dashboard.mjs | warehouse-rota/lib/dashboard.mjs |
+
+6. Commit all five replacements together to **main**.
+7. If Render Auto-Deploy is **On Commit**, wait for that deployment to become **Live**. If it is **Off**, select **Manual Deploy → Deploy latest commit** in **dylan-oaks-warehouse-rota**. A restart alone does not load a new commit.
+8. Refresh the rota. The toolbar should have **Clear rota**; Day view should have **Clear day** and **Set required hours**, with two hours cards and no Budget card.
+
+Keep the existing persistent disk, DATA_DIR, manager password, dashboard connection and integration key. Root Directory stays warehouse-rota, Build Command stays npm ci and Start Command stays npm start. No dashboard service files or dependencies need changing.
+
+The update uses the existing schema 4 database. Deploying the files preserves saved colleagues, shifts, attendance, requirements, publications and QR links. Clearing shifts happens only when a manager confirms a clear action.
+
+Build marker: **rota-week-controls-20261004**. The complete package includes 55 automated tests and the browser review script.
