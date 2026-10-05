@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
 import { rotaPDF } from './lib/pdf.mjs';
 import { createDashboardReader } from './lib/dashboard.mjs';
+import { normalizeAvailability, availabilityWarning, isShiftAvailable } from './public/availability.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -33,7 +34,7 @@ export function monday(date = today()) {
   return addDays(date, -((day + 6) % 7));
 }
 class Problem extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, details = {}) { super(message); this.status = status; this.details = details; }
 }
 function requireThat(condition, message, status = 400) {
   if (!condition) throw new Problem(status, message);
@@ -150,7 +151,7 @@ export function createRotaServer(options = {}) {
     CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, password_fingerprint TEXT NOT NULL);
   `);
   const schemaVersion = Number(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value);
-  requireThat(schemaVersion <= 4, 'This database needs a newer version of the rota app.', 500);
+  requireThat(schemaVersion <= 5, 'This database needs a newer version of the rota app.', 500);
   if (schemaVersion < 2) {
     // Keep the original assignments and QR tokens. Old warehouse assignments
     // stay unset until a manager chooses them; never guess where someone works.
@@ -207,6 +208,20 @@ export function createRotaServer(options = {}) {
       UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
       COMMIT;`);
   }
+  if (schemaVersion < 5) {
+    if (db.prepare('SELECT COUNT(*) AS n FROM people').get().n > 0) {
+      const dir = path.join(dataDir, 'backups'); fs.mkdirSync(dir, { recursive: true });
+      const destination = path.join(dir, 'rota-before-schema-5.sqlite');
+      if (!fs.existsSync(destination)) db.prepare('VACUUM INTO ?').run(destination);
+    }
+    db.exec(`BEGIN IMMEDIATE;
+      ALTER TABLE people ADD COLUMN availability TEXT NOT NULL DEFAULT 'null';
+      ALTER TABLE people ADD COLUMN default_warehouse TEXT NOT NULL DEFAULT '';
+      ALTER TABLE people ADD COLUMN preferred_template_id TEXT REFERENCES templates(id) ON DELETE SET NULL;
+      UPDATE meta SET value = '5' WHERE key = 'schema_version';
+      UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
+      COMMIT;`);
+  }
   if (!db.prepare('SELECT id FROM locations LIMIT 1').get()) {
     db.prepare('INSERT INTO locations (id, name, share_token) VALUES (?, ?, ?)').run(uuid(), 'Warehouse', token());
   }
@@ -234,10 +249,11 @@ export function createRotaServer(options = {}) {
     requireThat(row, 'Location not found.', 404);
     return row;
   };
+  const personRecord = row => ({ ...row, availability: JSON.parse(row.availability) });
   const person = id => {
     const row = db.prepare('SELECT * FROM people WHERE id = ?').get(id);
     requireThat(row, 'Colleague not found.', 404);
-    return row;
+    return personRecord(row);
   };
   function snapshot(locationId, week) {
     const loc = location(locationId);
@@ -259,12 +275,12 @@ export function createRotaServer(options = {}) {
       dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
     }));
     return {
-      revision: revision(), week, demo, build: 'rota-shift-labels-20261004', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      revision: revision(), week, demo, build: 'rota-availability-20261005', departments: DEPARTMENTS, warehouses: WAREHOUSES,
       previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
       previousAttendance: db.prepare('SELECT * FROM attendance WHERE date = ? ORDER BY person_id').all(addDays(week, -1)),
       dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
       locations: db.prepare('SELECT id, name, share_token, active FROM locations ORDER BY active DESC, name COLLATE NOCASE').all(),
-      people: db.prepare('SELECT * FROM people ORDER BY team COLLATE NOCASE, row_order, name COLLATE NOCASE, id').all(),
+      people: db.prepare('SELECT * FROM people ORDER BY team COLLATE NOCASE, row_order, name COLLATE NOCASE, id').all().map(personRecord),
       templates: db.prepare('SELECT * FROM templates ORDER BY name COLLATE NOCASE').all(),
       shifts: db.prepare('SELECT * FROM shifts WHERE date BETWEEN ? AND ? ORDER BY date, start_time, id').all(week, addDays(week, 6)),
       attendance: db.prepare('SELECT * FROM attendance WHERE date BETWEEN ? AND ? ORDER BY date, person_id').all(week, addDays(week, 6)),
@@ -289,6 +305,11 @@ export function createRotaServer(options = {}) {
   }
   const insertShift = db.prepare('INSERT INTO shifts (id, person_id, location_id, date, start_time, end_time, break_minutes, kind, label, colour, note, department, warehouse, break_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
   const shiftArgs = s => [s.id, s.person_id, s.location_id, s.date, s.start_time, s.end_time, s.break_minutes, s.kind, s.label, s.colour, s.note, s.department, s.warehouse, s.break_start];
+  function checkAvailability(shifts, body) {
+    if (body.override_availability === true) return;
+    const warnings = shifts.map(shift => ({ person_id: shift.person_id, date: shift.date, message: availabilityWarning(person(shift.person_id), shift) })).filter(w => w.message);
+    if (warnings.length) throw new Problem(422, 'This shift is outside saved availability. Review the warning and choose Schedule anyway to override.', { code: 'availability_warning', warnings });
+  }
   function savePerson(body, id) {
     const loc = location(body.location_id);
     requireThat(loc.active || id, 'Choose an active location.');
@@ -303,19 +324,72 @@ export function createRotaServer(options = {}) {
     const hours = Number(body.contract_hours ?? 0);
     requireThat(Number.isFinite(hours) && hours >= 0 && hours <= 100, 'Contracted hours must be between 0 and 100. Leave this at 0 if not applicable.');
     const active = body.active === false || body.active === 0 ? 0 : 1;
+    let availability;
+    try { availability = normalizeAvailability(body.availability === undefined ? existing?.availability ?? null : body.availability); }
+    catch (error) { throw new Problem(400, error.message); }
+    const defaultWarehouse = body.default_warehouse ?? existing?.default_warehouse ?? '';
+    requireThat(defaultWarehouse === '' || WAREHOUSES.includes(defaultWarehouse), 'Choose Warehouse 1 or Warehouse 2, or leave the warehouse unset.');
+    const preferredTemplate = body.preferred_template_id === undefined ? existing?.preferred_template_id ?? null : body.preferred_template_id || null;
+    requireThat(preferredTemplate === null || typeof preferredTemplate === 'string' && db.prepare('SELECT id FROM templates WHERE id = ?').get(preferredTemplate), 'Choose an existing preferred shift pattern, or leave it unset.');
     if (id) {
-      db.prepare('UPDATE people SET name = ?, team = ?, role = ?, contract_minutes = ?, location_id = ?, active = ?, default_department = ?, leaderboard_name = ?, is_example = ? WHERE id = ?')
-        .run(name, team, role, Math.round(hours * 60), loc.id, active, defaultDepartment, leaderboardName, isExample, id);
+      db.prepare('UPDATE people SET name = ?, team = ?, role = ?, contract_minutes = ?, location_id = ?, active = ?, default_department = ?, leaderboard_name = ?, is_example = ?, availability = ?, default_warehouse = ?, preferred_template_id = ? WHERE id = ?')
+        .run(name, team, role, Math.round(hours * 60), loc.id, active, defaultDepartment, leaderboardName, isExample, JSON.stringify(availability), defaultWarehouse, preferredTemplate, id);
       return id;
     }
     const newId = uuid();
     const order = db.prepare('SELECT COALESCE(MAX(row_order), 0) + 1 AS n FROM people').get().n;
-    db.prepare('INSERT INTO people (id, name, team, role, contract_minutes, location_id, active, row_order, default_department, leaderboard_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(newId, name, team, role, Math.round(hours * 60), loc.id, active, order, defaultDepartment, leaderboardName);
+    db.prepare('INSERT INTO people (id, name, team, role, contract_minutes, location_id, active, row_order, default_department, leaderboard_name, availability, default_warehouse, preferred_template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(newId, name, team, role, Math.round(hours * 60), loc.id, active, order, defaultDepartment, leaderboardName, JSON.stringify(availability), defaultWarehouse, preferredTemplate);
     return newId;
   }
   function backupFile(destination) {
     db.prepare('VACUUM INTO ?').run(destination);
+  }
+  function availabilityPlan(body) {
+    const loc = location(body.location_id), week = weekValue(body.week);
+    requireThat(loc.active, 'Reactivate this location before filling the rota.');
+    requireThat(Array.isArray(body.person_ids) && body.person_ids.length > 0 && Array.isArray(body.dates) && body.dates.length > 0, 'Choose colleagues and days to fill.');
+    const ids = [...new Set(body.person_ids)], dates = [...new Set(body.dates)].map(dateValue).sort();
+    requireThat(ids.length * dates.length <= 1000, 'Fill at most 1,000 colleague days at once.');
+    requireThat(ids.every(id => typeof id === 'string'), 'Choose valid colleague profiles.');
+    requireThat(dates.every(date => date >= week && date <= addDays(week, 6)), 'Choose dates in the displayed rota week.');
+    const fallbackWarehouse = body.warehouse || '';
+    requireThat(!fallbackWarehouse || WAREHOUSES.includes(fallbackWarehouse), 'Choose a valid fallback warehouse.');
+    const templateId = body.template_id || null;
+    requireThat(!templateId || typeof templateId === 'string' && db.prepare('SELECT id FROM templates WHERE id = ?').get(templateId), 'Choose an existing shift pattern.');
+    const breakMinutes = integer(Number(body.break_minutes ?? 30), 0, 240, 'Unpaid break');
+    const selectedPeople = ids.map(person), shifts = [], skipped = [];
+    const totals = new Map(selectedPeople.map(p => [p.id, db.prepare('SELECT * FROM shifts WHERE person_id = ? AND date BETWEEN ? AND ?').all(p.id, week, addDays(week, 6)).reduce((sum, s) => sum + scheduledMinutes(s), 0)]));
+    const timeLabel = value => `${String(Math.floor(value / 60) % 24).padStart(2, '0')}:${String(value % 60).padStart(2, '0')}`;
+    for (const date of dates) for (const p of selectedPeople) {
+      const skip = reason => skipped.push({ person_id: p.id, name: p.name, date, reason });
+      if (!p.active || p.location_id !== loc.id) { skip('Not an active colleague at this location'); continue; }
+      if (!p.availability) { skip('Availability not set'); continue; }
+      const day = p.availability.days[(new Date(`${date}T12:00:00Z`).getUTCDay() + 6) % 7];
+      if (day.mode === 'unavailable') { skip('Unavailable'); continue; }
+      if (db.prepare('SELECT id FROM shifts WHERE person_id = ? AND date = ? LIMIT 1').get(p.id, date)) { skip('Already has a shift or absence'); continue; }
+      if (!p.default_department) { skip('Department not set in profile'); continue; }
+      const warehouse = p.default_warehouse || fallbackWarehouse;
+      if (!warehouse) { skip('Warehouse not set in profile or fill options'); continue; }
+      const preferred = templateId || p.preferred_template_id;
+      const pattern = preferred ? db.prepare('SELECT * FROM templates WHERE id = ?').get(preferred) : null;
+      if (!pattern && day.mode === 'all_day') { skip('All-day availability needs a shift pattern'); continue; }
+      const duration = pattern ? 0 : (timeMinutes(day.end) - timeMinutes(day.start) + 1440) % 1440;
+      if (!pattern && duration <= breakMinutes) { skip('Available window is shorter than the unpaid break'); continue; }
+      const fields = pattern ? { ...pattern, label: pattern.name, note: '' } : {
+        kind: 'work', label: 'Shift', start_time: day.start, end_time: day.end,
+        break_minutes: breakMinutes,
+        break_start: breakMinutes ? timeLabel(timeMinutes(day.start) + Math.floor((duration - breakMinutes) / 2 / 15) * 15) : null
+      };
+      let shift;
+      try { shift = validateShift({ ...fields, person_id: p.id, location_id: loc.id, date, department: p.default_department, warehouse }, undefined, shifts); }
+      catch (error) { if (error instanceof Problem && error.status === 422) { skip('Overlaps an existing shift or absence'); continue; } throw error; }
+      if (!isShiftAvailable(p.availability, shift)) { skip('Shift pattern is outside availability'); continue; }
+      const netMinutes = scheduledMinutes(shift);
+      if (body.respect_contract_hours !== false && p.contract_minutes > 0 && totals.get(p.id) + netMinutes > p.contract_minutes) { skip('Would exceed contracted weekly hours'); continue; }
+      shifts.push(shift); totals.set(p.id, totals.get(p.id) + netMinutes);
+    }
+    return { week, shifts, skipped, total_minutes: shifts.reduce((sum, shift) => sum + scheduledMinutes(shift), 0) };
   }
   function dailyBackup() {
     const dir = path.join(dataDir, 'backups');
@@ -459,6 +533,15 @@ export function createRotaServer(options = {}) {
           return send(res, 200, { ok: true });
         }
         if (method === 'GET' && pathname === '/api/state') return send(res, 200, state(weekValue(url.searchParams.get('week') || monday())));
+        if (method === 'GET' && pathname === '/api/weeks/availability-plan') {
+          const plan = availabilityPlan({
+            location_id: url.searchParams.get('locationId'), week: url.searchParams.get('week'),
+            person_ids: (url.searchParams.get('people') || '').split(',').filter(Boolean), dates: (url.searchParams.get('dates') || '').split(',').filter(Boolean),
+            warehouse: url.searchParams.get('warehouse'), template_id: url.searchParams.get('template'),
+            break_minutes: url.searchParams.get('breakMinutes') ?? 30, respect_contract_hours: url.searchParams.get('contractLimit') !== 'false'
+          });
+          return send(res, 200, { ...plan, revision: revision() });
+        }
         if (method === 'GET' && /^\/api\/people\/[^/]+\/performance$/.test(pathname)) {
           const colleague = person(pathname.split('/')[3]);
           const requestedWeek = url.searchParams.get('week');
@@ -540,6 +623,14 @@ export function createRotaServer(options = {}) {
             dashboard.reset(); return { saved: true };
           }
           if (method === 'POST' && pathname === '/api/people') return { id: savePerson(body) };
+          if (method === 'PUT' && /^\/api\/people\/[^/]+\/availability$/.test(pathname)) {
+            const id = pathname.split('/')[3]; person(id);
+            let availability;
+            try { availability = normalizeAvailability(body.availability); }
+            catch (error) { throw new Problem(400, error.message); }
+            db.prepare('UPDATE people SET availability = ? WHERE id = ?').run(JSON.stringify(availability), id);
+            return { id };
+          }
           if (method === 'PUT' && /^\/api\/people\/[^/]+$/.test(pathname)) return { id: savePerson(body, pathname.split('/').at(-1)) };
           if (method === 'DELETE' && /^\/api\/people\/[^/]+$/.test(pathname)) {
             const id = pathname.split('/').at(-1);
@@ -579,12 +670,14 @@ export function createRotaServer(options = {}) {
           }
           if (method === 'POST' && pathname === '/api/shifts') {
             const shift = validateShift(body);
+            checkAvailability([shift], body);
             insertShift.run(...shiftArgs(shift)); return { id: shift.id };
           }
           if (method === 'PUT' && /^\/api\/shifts\/[^/]+$/.test(pathname)) {
             const id = pathname.split('/').at(-1);
             requireThat(db.prepare('SELECT id FROM shifts WHERE id = ?').get(id), 'Shift not found.', 404);
             const shift = validateShift(body, id);
+            checkAvailability([shift], body);
             db.prepare('DELETE FROM shifts WHERE id = ?').run(id);
             insertShift.run(...shiftArgs(shift)); return { id };
           }
@@ -598,8 +691,14 @@ export function createRotaServer(options = {}) {
             requireThat(people.length * dates.length <= 1000, 'Assign at most 1,000 shifts at once.');
             const pending = [];
             for (const person_id of people) for (const date of dates) pending.push(validateShift({ ...body, person_id, date }, undefined, pending));
+            checkAvailability(pending, body);
             for (const shift of pending) insertShift.run(...shiftArgs(shift));
             return { created: pending.length };
+          }
+          if (method === 'POST' && pathname === '/api/weeks/populate') {
+            const plan = availabilityPlan(body);
+            for (const shift of plan.shifts) insertShift.run(...shiftArgs(shift));
+            return { created: plan.shifts.length, skipped: plan.skipped, total_minutes: plan.total_minutes };
           }
           if (method === 'POST' && pathname === '/api/shifts/clear') {
             const loc = location(body.location_id);
@@ -616,15 +715,16 @@ export function createRotaServer(options = {}) {
             requireThat(loc.active, 'Reactivate this location before copying shifts.');
             const sourceWeek = addDays(week, -7);
             const shifts = db.prepare('SELECT * FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ? ORDER BY date').all(loc.id, sourceWeek, addDays(sourceWeek, 6));
-            let copied = 0, skipped = 0;
+            let copied = 0, skipped = 0, availabilitySkipped = 0;
             for (const shift of shifts) {
               if (!person(shift.person_id).active) { skipped++; continue; }
               try {
                 const next = validateShift({ ...shift, date: addDays(shift.date, 7) }, undefined, [], true);
+                if (!isShiftAvailable(person(shift.person_id).availability, next)) { skipped++; availabilitySkipped++; continue; }
                 insertShift.run(...shiftArgs(next)); copied++;
               } catch (error) { if (error.status === 422) skipped++; else throw error; }
             }
-            return { copied, skipped };
+            return { copied, skipped, availability_skipped: availabilitySkipped };
           }
           if (method === 'POST' && pathname === '/api/publish') {
             const loc = location(body.location_id), week = weekValue(body.week);
@@ -660,14 +760,14 @@ export function createRotaServer(options = {}) {
         return send(res, 200, result);
       }
       requireThat(method === 'GET' || method === 'HEAD', 'Method not allowed.', 405);
-      const publicFiles = { '/coverage.js': ['coverage.js', 'text/javascript; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
+      const publicFiles = { '/availability.js': ['availability.js', 'text/javascript; charset=utf-8'], '/coverage.js': ['coverage.js', 'text/javascript; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
       const file = publicFiles[pathname];
       if (file) return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', file[0])), file[1]);
       if (pathname === '/' || /^\/rota\/[A-Za-z0-9_-]{43}$/.test(pathname)) return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', 'index.html')), 'text/html; charset=utf-8');
       return send(res, 404, { error: 'Page not found.' });
     } catch (error) {
       if (!(error instanceof Problem)) console.error('Request failed:', error.message);
-      if (!res.headersSent) send(res, error.status || 500, { error: error instanceof Problem ? error.message : 'Something went wrong. Please try again.' });
+      if (!res.headersSent) send(res, error.status || 500, { error: error instanceof Problem ? error.message : 'Something went wrong. Please try again.', ...(error instanceof Problem ? error.details : {}) });
       else res.end();
     }
   });
