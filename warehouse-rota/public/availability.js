@@ -24,6 +24,12 @@ export function availabilityDayText(availability, index) {
   return `${day.start}–${day.end}${day.end < day.start ? ' (+1 day)' : ''}`;
 }
 
+export function hasAvailabilityOnDate(availability, date) {
+  if (!availability) return true; // Unset availability does not mean unavailable.
+  const index = dayIndex(date), current = availability.days[index], previous = availability.days[(index + 6) % 7];
+  return current.mode !== 'unavailable' || previous.mode === 'times' && previous.end < previous.start && previous.end !== '00:00';
+}
+
 export function isShiftAvailable(availability, shift) {
   if (!availability || !['work', 'training'].includes(shift.kind || 'work')) return true;
   if (!validTime(shift.start_time) || !validTime(shift.end_time) || shift.start_time === shift.end_time) return true; // Time validation runs separately.

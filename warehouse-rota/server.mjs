@@ -8,6 +8,8 @@ import QRCode from 'qrcode';
 import { rotaPDF } from './lib/pdf.mjs';
 import { createDashboardReader } from './lib/dashboard.mjs';
 import { normalizeAvailability, availabilityWarning, isShiftAvailable } from './public/availability.js';
+import { arrivalDetails } from './public/manager-tools.js';
+import { holidayBalance } from './lib/holiday.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -151,7 +153,7 @@ export function createRotaServer(options = {}) {
     CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, password_fingerprint TEXT NOT NULL);
   `);
   const schemaVersion = Number(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value);
-  requireThat(schemaVersion <= 5, 'This database needs a newer version of the rota app.', 500);
+  requireThat(schemaVersion <= 6, 'This database needs a newer version of the rota app.', 500);
   if (schemaVersion < 2) {
     // Keep the original assignments and QR tokens. Old warehouse assignments
     // stay unset until a manager chooses them; never guess where someone works.
@@ -222,6 +224,32 @@ export function createRotaServer(options = {}) {
       UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
       COMMIT;`);
   }
+  if (schemaVersion < 6) {
+    if (db.prepare('SELECT COUNT(*) AS n FROM people').get().n > 0) {
+      const dir = path.join(dataDir, 'backups'); fs.mkdirSync(dir, { recursive: true });
+      const destination = path.join(dir, 'rota-before-schema-6.sqlite');
+      if (!fs.existsSync(destination)) db.prepare('VACUUM INTO ?').run(destination);
+    }
+    db.exec(`BEGIN IMMEDIATE;
+      ALTER TABLE attendance ADD COLUMN arrival_time TEXT;
+      ALTER TABLE attendance ADD COLUMN arrival_date TEXT;
+      ALTER TABLE attendance ADD COLUMN is_late INTEGER NOT NULL DEFAULT 0 CHECK(is_late IN (0,1));
+      ALTER TABLE attendance ADD COLUMN late_minutes INTEGER CHECK(late_minutes >= 0);
+      ALTER TABLE shifts ADD COLUMN holiday_minutes INTEGER CHECK(holiday_minutes > 0 AND holiday_minutes <= 1440);
+      ALTER TABLE shifts ADD COLUMN holiday_approved INTEGER NOT NULL DEFAULT 1 CHECK(holiday_approved IN (0,1));
+      CREATE TABLE leave_accounts (
+        person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        year_start TEXT NOT NULL, year_end TEXT NOT NULL, tracking_start TEXT NOT NULL,
+        day_minutes INTEGER NOT NULL CHECK(day_minutes > 0 AND day_minutes <= 1440),
+        allowance_minutes INTEGER NOT NULL CHECK(allowance_minutes >= 0),
+        carry_minutes INTEGER NOT NULL CHECK(carry_minutes >= 0),
+        opening_taken_minutes INTEGER NOT NULL CHECK(opening_taken_minutes >= 0),
+        PRIMARY KEY(person_id, year_start)
+      );
+      UPDATE meta SET value = '6' WHERE key = 'schema_version';
+      UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
+      COMMIT;`);
+  }
   if (!db.prepare('SELECT id FROM locations LIMIT 1').get()) {
     db.prepare('INSERT INTO locations (id, name, share_token) VALUES (?, ?, ?)').run(uuid(), 'Warehouse', token());
   }
@@ -266,7 +294,7 @@ export function createRotaServer(options = {}) {
       location: { id: loc.id, name: loc.name }, week, people,
       departments: DEPARTMENTS, warehouses: WAREHOUSES,
       // Absence reasons and daily manager records do not go on the shared rota.
-      shifts: shifts.map(({ note, ...shift }) => shift.kind === 'sick' ? { ...shift, kind: 'unavailable', label: 'Unavailable' } : shift)
+      shifts: shifts.map(({ note, holiday_minutes, holiday_approved, ...shift }) => shift.kind === 'sick' ? { ...shift, kind: 'unavailable', label: 'Unavailable' } : shift)
     };
   }
   function state(week) {
@@ -275,7 +303,7 @@ export function createRotaServer(options = {}) {
       dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
     }));
     return {
-      revision: revision(), week, demo, build: 'rota-availability-20261005', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      revision: revision(), week, demo, build: 'rota-manager-tools-20261009', departments: DEPARTMENTS, warehouses: WAREHOUSES,
       previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
       previousAttendance: db.prepare('SELECT * FROM attendance WHERE date = ? ORDER BY person_id').all(addDays(week, -1)),
       dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
@@ -293,6 +321,20 @@ export function createRotaServer(options = {}) {
     requireThat(p.active && loc.active, 'Reactivate this colleague or location before assigning shifts.');
     const shift = { id: skipId || uuid(), person_id: p.id, location_id: loc.id, date: dateValue(body.date), ...shiftFields(body) };
     const working = ['work', 'training'].includes(shift.kind);
+    const previous = skipId ? db.prepare('SELECT holiday_minutes, holiday_approved, kind FROM shifts WHERE id = ?').get(skipId) : null;
+    const holidayHours = body.holiday_hours === undefined ? undefined : body.holiday_hours;
+    shift.holiday_minutes = null;
+    if (shift.kind === 'holiday') {
+      if (holidayHours === undefined) shift.holiday_minutes = body.holiday_minutes === undefined ? previous?.kind === 'holiday' ? previous.holiday_minutes : null : body.holiday_minutes;
+      else if (holidayHours !== '' && holidayHours !== null) {
+        requireThat((typeof holidayHours === 'number' || typeof holidayHours === 'string') && Number.isFinite(Number(holidayHours)) && Number(holidayHours) > 0 && Number(holidayHours) <= 24, 'Holiday hours must be greater than 0 and at most 24, or left blank.');
+        shift.holiday_minutes = Math.round(Number(holidayHours) * 60);
+      }
+    }
+    if (shift.holiday_minutes !== null) integer(shift.holiday_minutes, 1, 1440, 'Holiday hours in minutes');
+    if (body.holiday_approved !== undefined) requireThat([true, false, 0, 1].includes(body.holiday_approved), 'Choose whether this holiday is approved.');
+    const approval = body.holiday_approved ?? (previous?.kind === 'holiday' ? previous.holiday_approved : 1);
+    shift.holiday_approved = shift.kind === 'holiday' && (approval === false || approval === 0) ? 0 : 1;
     shift.department = body.department === undefined ? p.default_department : body.department;
     shift.warehouse = body.warehouse ?? '';
     shift.colour = ({ Picking: 'blue', Engraving: 'violet', Packing: 'teal' })[shift.department] || shift.colour;
@@ -303,8 +345,8 @@ export function createRotaServer(options = {}) {
     requireThat(!conflict, `${p.name} already has an overlapping shift or absence on ${conflict?.date || shift.date}.`, 422);
     return shift;
   }
-  const insertShift = db.prepare('INSERT INTO shifts (id, person_id, location_id, date, start_time, end_time, break_minutes, kind, label, colour, note, department, warehouse, break_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-  const shiftArgs = s => [s.id, s.person_id, s.location_id, s.date, s.start_time, s.end_time, s.break_minutes, s.kind, s.label, s.colour, s.note, s.department, s.warehouse, s.break_start];
+  const insertShift = db.prepare('INSERT INTO shifts (id, person_id, location_id, date, start_time, end_time, break_minutes, kind, label, colour, note, department, warehouse, break_start, holiday_minutes, holiday_approved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const shiftArgs = s => [s.id, s.person_id, s.location_id, s.date, s.start_time, s.end_time, s.break_minutes, s.kind, s.label, s.colour, s.note, s.department, s.warehouse, s.break_start, s.holiday_minutes ?? null, s.holiday_approved ?? 1];
   function checkAvailability(shifts, body) {
     if (body.override_availability === true) return;
     const warnings = shifts.map(shift => ({ person_id: shift.person_id, date: shift.date, message: availabilityWarning(person(shift.person_id), shift) })).filter(w => w.message);
@@ -390,6 +432,55 @@ export function createRotaServer(options = {}) {
       shifts.push(shift); totals.set(p.id, totals.get(p.id) + netMinutes);
     }
     return { week, shifts, skipped, total_minutes: shifts.reduce((sum, shift) => sum + scheduledMinutes(shift), 0) };
+  }
+  function dayCopyPlan(body) {
+    const loc = location(body.location_id), source = dateValue(body.source_date), target = dateValue(body.target_date);
+    requireThat(loc.active, 'Reactivate this location before copying shifts.');
+    requireThat(source !== target, 'Choose a different day to copy into.');
+    const original = db.prepare("SELECT * FROM shifts WHERE location_id = ? AND date = ? AND kind IN ('work', 'training') ORDER BY person_id, start_time, id").all(loc.id, source);
+    requireThat(original.length <= 1000, 'Copy at most 1,000 shifts at once.');
+    const shifts = [], skipped = [], warnings = [];
+    for (const entry of original) {
+      const p = person(entry.person_id), skip = reason => skipped.push({ person_id: p.id, name: p.name, reason });
+      if (!p.active) { skip('Colleague is archived'); continue; }
+      let shift;
+      try { shift = validateShift({ ...entry, date: target }, undefined, shifts, true); }
+      catch (error) { if (error instanceof Problem && error.status === 422) { skip(error.message); continue; } throw error; }
+      const warning = availabilityWarning(p, shift);
+      if (warning) {
+        warnings.push({ person_id: p.id, name: p.name, message: warning });
+        if (body.override_availability !== true) { skip('Outside saved availability'); continue; }
+      }
+      shifts.push(shift);
+    }
+    return { source_date: source, target_date: target, source_count: original.length, shifts, skipped, warnings, total_minutes: shifts.reduce((total, s) => total + scheduledMinutes(s), 0) };
+  }
+  function leaveProfile(id, date, yearStart) {
+    person(id);
+    const accounts = db.prepare('SELECT * FROM leave_accounts WHERE person_id = ? ORDER BY year_start DESC').all(id);
+    const account = yearStart ? accounts.find(a => a.year_start === dateValue(yearStart)) : accounts.find(a => a.year_start <= date && a.year_end >= date);
+    if (yearStart) requireThat(account, 'Holiday year not found.', 404);
+    const shifts = db.prepare("SELECT s.*, l.name AS location_name FROM shifts s JOIN locations l ON l.id = s.location_id WHERE person_id = ? AND kind = 'holiday' ORDER BY date, id").all(id);
+    return { accounts, account: account || null, as_of: today(), revision: revision(), ...(account ? holidayBalance(account, shifts, today()) : { bookings: shifts.filter(s => s.date >= `${date.slice(0, 4)}-01-01` && s.date <= `${date.slice(0, 4)}-12-31`) }) };
+  }
+  function saveLeaveAccount(id, body) {
+    person(id);
+    const start = dateValue(body.year_start), end = dateValue(body.year_end), tracking = dateValue(body.tracking_start || start);
+    const originalStart = body.original_year_start ? dateValue(body.original_year_start) : start;
+    if (body.original_year_start) requireThat(db.prepare('SELECT year_start FROM leave_accounts WHERE person_id = ? AND year_start = ?').get(id, originalStart), 'Holiday year not found. Reopen the profile.', 404);
+    requireThat(end >= start && end <= addDays(start, 365), 'The holiday year must be at most 366 days, including its start and end.');
+    requireThat(tracking >= start && tracking <= end, 'Tracking starts within the holiday year.');
+    requireThat(!db.prepare('SELECT year_start FROM leave_accounts WHERE person_id = ? AND year_start != ? AND year_start <= ? AND year_end >= ?').get(id, originalStart, end, start), 'This holiday year overlaps an existing year.');
+    const hoursValue = (value, name, max = 10000) => {
+      requireThat((typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= max, `${name} must be hours between 0 and ${max}.`);
+      return Math.round(Number(value) * 60);
+    };
+    const day = hoursValue(body.day_hours, 'Usual working day', 24);
+    requireThat(day > 0, 'Enter the paid hours in one usual working day.');
+    const allowance = hoursValue(body.allowance_hours, 'Annual allowance'), carry = hoursValue(body.carry_hours ?? 0, 'Carry-over'), opening = hoursValue(body.opening_taken_hours ?? 0, 'Opening days taken');
+    if (originalStart !== start) db.prepare('UPDATE leave_accounts SET year_start=?, year_end=?, tracking_start=?, day_minutes=?, allowance_minutes=?, carry_minutes=?, opening_taken_minutes=? WHERE person_id=? AND year_start=?').run(start, end, tracking, day, allowance, carry, opening, id, originalStart);
+    else db.prepare('INSERT INTO leave_accounts (person_id, year_start, year_end, tracking_start, day_minutes, allowance_minutes, carry_minutes, opening_taken_minutes) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(person_id, year_start) DO UPDATE SET year_end=excluded.year_end, tracking_start=excluded.tracking_start, day_minutes=excluded.day_minutes, allowance_minutes=excluded.allowance_minutes, carry_minutes=excluded.carry_minutes, opening_taken_minutes=excluded.opening_taken_minutes').run(id, start, end, tracking, day, allowance, carry, opening);
+    return { saved: true, year_start: start };
   }
   function dailyBackup() {
     const dir = path.join(dataDir, 'backups');
@@ -533,6 +624,12 @@ export function createRotaServer(options = {}) {
           return send(res, 200, { ok: true });
         }
         if (method === 'GET' && pathname === '/api/state') return send(res, 200, state(weekValue(url.searchParams.get('week') || monday())));
+        if (method === 'GET' && pathname === '/api/days/copy-plan') {
+          return send(res, 200, { ...dayCopyPlan({ location_id: url.searchParams.get('locationId'), source_date: url.searchParams.get('sourceDate'), target_date: url.searchParams.get('targetDate'), override_availability: url.searchParams.get('overrideAvailability') === 'true' }), revision: revision() });
+        }
+        if (method === 'GET' && /^\/api\/people\/[^/]+\/holiday$/.test(pathname)) {
+          return send(res, 200, leaveProfile(pathname.split('/')[3], dateValue(url.searchParams.get('date') || today()), url.searchParams.get('yearStart')));
+        }
         if (method === 'GET' && pathname === '/api/weeks/availability-plan') {
           const plan = availabilityPlan({
             location_id: url.searchParams.get('locationId'), week: url.searchParams.get('week'),
@@ -591,16 +688,27 @@ export function createRotaServer(options = {}) {
         const result = mutation(req, () => {
           if (method === 'POST' && pathname === '/api/attendance') {
             const p = person(body.person_id), loc = location(body.location_id), date = dateValue(body.date);
-            requireThat(['checked_in', 'no_show', 'unmarked'].includes(body.status), 'Choose checked in, no show or clear attendance.');
+            requireThat(['checked_in', 'late', 'no_show', 'unmarked'].includes(body.status), 'Choose checked in, late, no show or clear attendance.');
             requireThat(date <= today(), 'Attendance can be marked on the shift date or afterwards.');
             if (body.status === 'unmarked') {
               db.prepare('DELETE FROM attendance WHERE person_id = ? AND location_id = ? AND date = ?').run(p.id, loc.id, date);
               return { cleared: true };
             }
-            requireThat(db.prepare("SELECT id FROM shifts WHERE person_id = ? AND location_id = ? AND date = ? AND kind IN ('work', 'training') LIMIT 1").get(p.id, loc.id, date), 'Attendance needs a work or training shift on this day.');
+            const first = db.prepare("SELECT * FROM shifts WHERE person_id = ? AND location_id = ? AND date = ? AND kind IN ('work', 'training') ORDER BY start_time, id LIMIT 1").get(p.id, loc.id, date);
+            requireThat(first, 'Attendance needs a work or training shift on this day.');
+            let arrival_time = null, arrival_date = null, is_late = body.status === 'late' ? 1 : 0, late_minutes = null;
+            if (body.arrival_time) {
+              requireThat(body.status === 'checked_in' || body.status === 'late', 'Record an arrival time with a check in.');
+              timeMinutes(body.arrival_time); arrival_time = body.arrival_time; arrival_date = dateValue(body.arrival_date || date);
+              requireThat(arrival_date === date || first.end_time < first.start_time && arrival_date === addDays(date, 1), 'Choose the shift date, or the next day for an overnight arrival.');
+              requireThat(arrival_date <= today(), 'An arrival cannot be recorded for a future day.');
+              try { ({ is_late, late_minutes } = arrivalDetails(first, arrival_date, arrival_time)); }
+              catch (error) { throw new Problem(400, error.message); }
+            }
+            const status = body.status === 'late' ? 'checked_in' : body.status;
             const marked_at = new Date().toISOString();
-            db.prepare('INSERT INTO attendance VALUES (?, ?, ?, ?, ?) ON CONFLICT(person_id, location_id, date) DO UPDATE SET status = excluded.status, marked_at = excluded.marked_at').run(p.id, loc.id, date, body.status, marked_at);
-            return { status: body.status, marked_at };
+            db.prepare('INSERT INTO attendance (person_id, location_id, date, status, marked_at, arrival_time, arrival_date, is_late, late_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(person_id, location_id, date) DO UPDATE SET status=excluded.status, marked_at=excluded.marked_at, arrival_time=excluded.arrival_time, arrival_date=excluded.arrival_date, is_late=excluded.is_late, late_minutes=excluded.late_minutes').run(p.id, loc.id, date, status, marked_at, arrival_time, arrival_date, is_late, late_minutes);
+            return { status, marked_at, arrival_time, arrival_date, is_late, late_minutes };
           }
           if (method === 'POST' && pathname === '/api/day-plans') {
             const loc = location(body.location_id), date = dateValue(body.date);
@@ -623,6 +731,7 @@ export function createRotaServer(options = {}) {
             dashboard.reset(); return { saved: true };
           }
           if (method === 'POST' && pathname === '/api/people') return { id: savePerson(body) };
+          if (method === 'PUT' && /^\/api\/people\/[^/]+\/holiday$/.test(pathname)) return saveLeaveAccount(pathname.split('/')[3], body);
           if (method === 'PUT' && /^\/api\/people\/[^/]+\/availability$/.test(pathname)) {
             const id = pathname.split('/')[3]; person(id);
             let availability;
@@ -700,6 +809,11 @@ export function createRotaServer(options = {}) {
             for (const shift of plan.shifts) insertShift.run(...shiftArgs(shift));
             return { created: plan.shifts.length, skipped: plan.skipped, total_minutes: plan.total_minutes };
           }
+          if (method === 'POST' && pathname === '/api/days/copy') {
+            const plan = dayCopyPlan(body);
+            for (const shift of plan.shifts) insertShift.run(...shiftArgs(shift));
+            return { copied: plan.shifts.length, skipped: plan.skipped, warnings: plan.warnings, source_date: plan.source_date, target_date: plan.target_date };
+          }
           if (method === 'POST' && pathname === '/api/shifts/clear') {
             const loc = location(body.location_id);
             requireThat(body.scope === 'day' || body.scope === 'week', 'Choose a day or week to clear.');
@@ -760,7 +874,7 @@ export function createRotaServer(options = {}) {
         return send(res, 200, result);
       }
       requireThat(method === 'GET' || method === 'HEAD', 'Method not allowed.', 405);
-      const publicFiles = { '/availability.js': ['availability.js', 'text/javascript; charset=utf-8'], '/coverage.js': ['coverage.js', 'text/javascript; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
+      const publicFiles = { '/manager-tools.js': ['manager-tools.js', 'text/javascript; charset=utf-8'], '/availability.js': ['availability.js', 'text/javascript; charset=utf-8'], '/coverage.js': ['coverage.js', 'text/javascript; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
       const file = publicFiles[pathname];
       if (file) return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', file[0])), file[1]);
       if (pathname === '/' || /^\/rota\/[A-Za-z0-9_-]{43}$/.test(pathname)) return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', 'index.html')), 'text/html; charset=utf-8');

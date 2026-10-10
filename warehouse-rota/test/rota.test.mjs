@@ -26,18 +26,19 @@ test('Original rota data migrates without changing times, published snapshots or
   let app;
   try {
     app = createRotaServer({ dataDir: dir, password: 'migration-test-password' });
-    assert.equal(app.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '3');
+    assert.equal(app.db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value, '6');
     assert.equal(app.db.prepare('SELECT default_department FROM people').get().default_department, 'Picking');
     const shift = app.db.prepare('SELECT * FROM shifts').get();
     assert.equal(shift.start_time, '08:00'); assert.equal(shift.department, 'Picking'); assert.equal(shift.warehouse, ''); assert.equal(shift.note, 'Private');
     assert.equal(app.db.prepare('SELECT share_token FROM locations').get().share_token, 'existing-shared-token');
     assert.equal(app.db.prepare('SELECT snapshot FROM publications').get().snapshot, published);
     assert.ok(existsSync(path.join(dir, 'backups', 'rota-before-schema-2.sqlite')));
+    assert.ok(existsSync(path.join(dir, 'backups', 'rota-before-schema-4.sqlite')));
     await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
     const base = `http://127.0.0.1:${app.server.address().port}`;
     const login = await fetch(base + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Rota-Request': '1' }, body: JSON.stringify({ password: 'migration-test-password' }) });
     const cookie = login.headers.get('set-cookie').split(';')[0];
-    const publish = await fetch(base + '/api/publish', { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json', 'X-Rota-Request': '1', 'If-Match': '9' }, body: JSON.stringify({ location_id: 'warehouse', week: '2026-10-05' }) });
+    const publish = await fetch(base + '/api/publish', { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json', 'X-Rota-Request': '1', 'If-Match': '12' }, body: JSON.stringify({ location_id: 'warehouse', week: '2026-10-05' }) });
     assert.equal(publish.status, 400);
     assert.equal(app.db.prepare('SELECT snapshot FROM publications').get().snapshot, published);
     await app.close(); app = createRotaServer({ dataDir: dir, password: 'migration-test-password' });
