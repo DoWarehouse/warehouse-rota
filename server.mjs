@@ -1,1355 +1,688 @@
 import http from 'node:http';
-import fs from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
+import { randomUUID, randomBytes, createHash, scryptSync, timingSafeEqual } from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import QRCode from 'qrcode';
+import { rotaPDF } from './lib/pdf.mjs';
+import { createDashboardReader } from './lib/dashboard.mjs';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PUBLIC_DIR = path.join(__dirname, 'public');
-const DATA_DIR = path.join(__dirname, 'data');
-const TARGETS_FILE = path.join(DATA_DIR, 'targets.json');
-const HISTORY_DIR = path.join(DATA_DIR, 'history');
-const CYCLE_DIR = path.join(DATA_DIR, 'cycle-times');
-const CYCLE_FILE = path.join(CYCLE_DIR, 'orders.json');
-const CYCLE_STATE_FILE = path.join(CYCLE_DIR, 'refresh-state.json');
-const PORT = Number(process.env.PORT || 8787);
-const HUTCH_API_BASE = process.env.HUTCH_API_BASE || 'https://api.tryhutch.co.uk';
-let hutchAccessToken = process.env.HUTCH_BEARER_TOKEN || '';
-const HUTCH_REFRESH_TOKEN = process.env.HUTCH_REFRESH_TOKEN || '';
-const DEFAULT_TARGET = Number(process.env.DEFAULT_TARGET || 2000);
-const APP_TIMEZONE = process.env.APP_TIMEZONE || 'Europe/London';
-const SNAPSHOT_INTERVAL_MS = Math.max(60000, Number(process.env.SNAPSHOT_INTERVAL_MS || 300000));
-const CURRENT_WAIT_REFRESH_MS = Math.max(60000, Number(process.env.CURRENT_WAIT_REFRESH_MS || 300000));
-const CYCLE_REFRESH_INTERVAL_MS = Math.max(3600000, Number(process.env.CYCLE_REFRESH_INTERVAL_MS || 10800000));
-const CYCLE_MAX_PAGES = Math.max(1, Math.min(100, Number(process.env.CYCLE_MAX_PAGES || 40)));
-const CYCLE_MAX_NEW_TIMELINES = Math.max(10, Math.min(500, Number(process.env.CYCLE_MAX_NEW_TIMELINES || 150)));
-const CYCLE_TIMELINE_DELAY_MS = Math.max(1000, Math.min(30000, Number(process.env.CYCLE_TIMELINE_DELAY_MS || 5000)));
-const CYCLE_BACKFILL_MAX_PAGES = Math.max(1, Math.min(100, Number(process.env.CYCLE_BACKFILL_MAX_PAGES || 50)));
-const CYCLE_BACKFILL_MAX_NEW_TIMELINES = Math.max(100, Math.min(5000, Number(process.env.CYCLE_BACKFILL_MAX_NEW_TIMELINES || 2500)));
-// One-time v6 reconciliation: scan deeper than the normal 40-page refresh so
-// older-created orders that shipped recently can be discovered and cached.
-const CYCLE_RECONCILE_MAX_PAGES = Math.max(40, Math.min(120, Number(process.env.CYCLE_RECONCILE_MAX_PAGES || 100)));
-const CYCLE_RECONCILE_MAX_NEW_TIMELINES = Math.max(100, Math.min(5000, Number(process.env.CYCLE_RECONCILE_MAX_NEW_TIMELINES || 5000)));
-const CYCLE_RECONCILE_RETRY_MS = Math.max(300000, Number(process.env.CYCLE_RECONCILE_RETRY_MS || 1800000));
-const CYCLE_BACKOFF_MS = [60000, 120000, 300000];
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const hash = value => createHash('sha256').update(value).digest('hex');
+const token = () => randomBytes(32).toString('base64url');
+const uuid = () => randomUUID();
+const KINDS = ['work', 'training', 'holiday', 'sick', 'unavailable'];
+const COLOURS = ['blue', 'teal', 'violet', 'amber'];
+const DEPARTMENTS = ['Picking', 'Engraving', 'Packing'];
+const WAREHOUSES = ['Warehouse 1', 'Warehouse 2'];
+const SESSION_MS = 12 * 60 * 60 * 1000;
 
-function parseScopes(value) {
-  if (!value) return {};
-  try { return JSON.parse(value); }
-  catch { return {}; }
+export function today() {
+  const parts = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+  const get = type => parts.find(part => part.type === type).value;
+  return `${get('year')}-${get('month')}-${get('day')}`;
 }
-let hutchScopes = parseScopes(process.env.HUTCH_SCOPES || '{}');
-let refreshPromise = null;
-let lastRefreshAt = null;
-const DEMO_MODE = process.env.DEMO_MODE === '1' || (!hutchAccessToken && !HUTCH_REFRESH_TOKEN);
-
-await fs.mkdir(DATA_DIR, { recursive: true });
-await fs.mkdir(HISTORY_DIR, { recursive: true });
-await fs.mkdir(CYCLE_DIR, { recursive: true });
-try { await fs.access(TARGETS_FILE); } catch { await fs.writeFile(TARGETS_FILE, '{}\n'); }
-
-function json(res, status, payload) {
-  const body = JSON.stringify(payload);
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-    'Cache-Control': 'no-store'
-  });
-  res.end(body);
+export function addDays(date, days) {
+  const value = new Date(`${date}T12:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
 }
-
-async function readBody(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString('utf8');
-  return raw ? JSON.parse(raw) : {};
+export function monday(date = today()) {
+  const day = new Date(`${date}T12:00:00Z`).getUTCDay();
+  return addDays(date, -((day + 6) % 7));
 }
-
-function londonDateParts(date = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: APP_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit'
-  }).formatToParts(date).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
-  return { year: parts.year, month: parts.month, day: parts.day, iso: `${parts.year}-${parts.month}-${parts.day}` };
+class Problem extends Error {
+  constructor(status, message) { super(message); this.status = status; }
 }
-
-function londonOffset(date = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: APP_TIMEZONE, hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit'
-  }).formatToParts(date).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
-  const asUTC = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second);
-  const mins = Math.round((asUTC - date.getTime()) / 60000);
-  const sign = mins >= 0 ? '+' : '-';
-  const abs = Math.abs(mins);
-  return `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+function requireThat(condition, message, status = 400) {
+  if (!condition) throw new Problem(status, message);
 }
-
-function hutchDatePayload() {
-  const d = londonDateParts();
-  return `${d.iso}T00:00:00${londonOffset()}`;
+function textValue(value, label, max = 100, optional = false) {
+  requireThat(typeof value === 'string', `${label} is required.`);
+  const trimmed = value.trim();
+  requireThat((optional || trimmed.length > 0) && trimmed.length <= max, `${label} must be ${optional ? 'at most' : 'between 1 and'} ${max} characters.`);
+  requireThat(!/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(trimmed), `${label} contains an unsupported character.`);
+  return trimmed;
 }
-
-async function getTargets() {
-  try { return JSON.parse(await fs.readFile(TARGETS_FILE, 'utf8')); }
-  catch { return {}; }
+function dateValue(value) {
+  requireThat(typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value), 'Choose a valid date.');
+  const parsed = new Date(`${value}T12:00:00Z`);
+  requireThat(Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value && value >= '2020-01-01' && value <= '2100-12-31', 'Choose a valid date between 2020 and 2100.');
+  return value;
 }
-
-async function saveTarget(date, target) {
-  const targets = await getTargets();
-  targets[date] = target;
-  await fs.writeFile(TARGETS_FILE, JSON.stringify(targets, null, 2) + '\n');
+function weekValue(value) { return monday(dateValue(value)); }
+function timeMinutes(value) {
+  requireThat(typeof value === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value), 'Enter a valid start and finish time.');
+  return Number(value.slice(0, 2)) * 60 + Number(value.slice(3));
 }
-
-async function hutchFetch(endpoint, payload, token = '') {
-  const headers = {
-    'Content-Type': 'application/json',
-    'Accept': 'application/json, text/plain, */*'
-  };
-  if (token) headers.Authorization = `Bearer ${token}`;
-
-  const response = await fetch(`${HUTCH_API_BASE}${endpoint}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(12000)
-  });
-
-  const text = await response.text();
-  let data;
-  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
-  return { response, data };
+function integer(value, min, max, label) {
+  requireThat(Number.isInteger(value) && value >= min && value <= max, `${label} must be a whole number from ${min} to ${max}.`);
+  return value;
 }
-
-async function refreshHutchAccessToken() {
-  if (!HUTCH_REFRESH_TOKEN) {
-    const error = new Error('Hutch login required');
-    error.status = 401;
-    error.code = 'AUTH_REQUIRED';
-    throw error;
-  }
-  if (refreshPromise) return refreshPromise;
-
-  refreshPromise = (async () => {
-    const { response, data } = await hutchFetch('/auth/Refresh', {
-      refresh_token: HUTCH_REFRESH_TOKEN,
-      scopes: hutchScopes
-    });
-
-    if (!response.ok || !data?.access_token) {
-      const error = new Error(`Unable to refresh Hutch login (${response.status})`);
-      error.status = response.status || 401;
-      error.code = 'AUTH_REQUIRED';
-      error.details = data;
-      throw error;
-    }
-
-    hutchAccessToken = data.access_token;
-    if (data.scopes !== undefined && data.scopes !== null) hutchScopes = data.scopes;
-    lastRefreshAt = new Date().toISOString();
-    return hutchAccessToken;
-  })();
-
-  try { return await refreshPromise; }
-  finally { refreshPromise = null; }
+export function scheduledMinutes(shift) {
+  if (!['work', 'training'].includes(shift.kind)) return 0;
+  let duration = timeMinutes(shift.end_time) - timeMinutes(shift.start_time);
+  if (duration < 0) duration += 1440;
+  return duration - shift.break_minutes;
 }
-
-async function hutchPost(endpoint, payload, allowRetry = true) {
-  if (!hutchAccessToken) await refreshHutchAccessToken();
-
-  let { response, data } = await hutchFetch(endpoint, payload, hutchAccessToken);
-
-  if (response.status === 401 && allowRetry && HUTCH_REFRESH_TOKEN) {
-    await refreshHutchAccessToken();
-    ({ response, data } = await hutchFetch(endpoint, payload, hutchAccessToken));
-  }
-
-  if (!response.ok) {
-    const error = new Error(`Hutch API returned ${response.status}`);
-    error.status = response.status;
-    error.code = response.status === 401 ? 'AUTH_REQUIRED' : 'HUTCH_ERROR';
-    error.details = data;
-    throw error;
-  }
-  return data;
+function interval(shift) {
+  const startOfDay = Date.parse(`${shift.date}T00:00:00Z`) / 60000;
+  if (!['work', 'training'].includes(shift.kind)) return [startOfDay, startOfDay + 1440];
+  const start = startOfDay + timeMinutes(shift.start_time);
+  let end = startOfDay + timeMinutes(shift.end_time);
+  if (end < start) end += 1440;
+  return [start, end];
 }
-
-const num = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
-
-function userRole(user) {
-  const role = String(user.role ?? user.task_role ?? user.type ?? user.activity ?? '').toLowerCase();
-  if (role.includes('pack')) return 'Packing';
-  if (role.includes('pick')) return 'Picking';
-  const packs = num(user.packs_completed ?? user.packsCompleted);
-  const picks = num(user.picks_completed ?? user.picksCompleted);
-  const tasks = num(user.tasks_completed ?? user.tasksCompleted);
-  if (picks > 0) return 'Picking';
-  if (packs > 0 && (tasks === 0 || packs === tasks)) return 'Packing';
-  if (tasks > 0 && packs === 0) return 'Picking';
-  return 'Other';
+function overlaps(a, b) {
+  if (a.person_id !== b.person_id) return false;
+  const [aStart, aEnd] = interval(a), [bStart, bEnd] = interval(b);
+  return aStart < bEnd && bStart < aEnd;
 }
-
-function userName(user) {
-  return [user.first_name ?? user.firstName, user.last_name ?? user.lastName].filter(Boolean).join(' ').trim()
-    || user.name || user.display_name || 'Unknown';
-}
-
-function packCount(user) {
-  return num(user.packs_completed ?? user.packsCompleted ?? (userRole(user) === 'Packing' ? user.tasks_completed : 0));
-}
-
-function pickCount(user) {
-  return num(user.picks_completed ?? user.picksCompleted ?? (userRole(user) === 'Picking' ? user.tasks_completed : 0));
-}
-
-function hourLabel(timestamp) {
-  const d = new Date(timestamp);
-  if (Number.isNaN(d.getTime())) return String(timestamp || '');
-  return new Intl.DateTimeFormat('en-GB', { timeZone: APP_TIMEZONE, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
-}
-
-function londonHourKey(date = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: APP_TIMEZONE,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', hour12: false, hourCycle: 'h23'
-  }).formatToParts(date).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
-  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}`;
-}
-
-function hourlyCountForRole(hour, role) {
-  if (role === 'Packing') return num(hour.packs ?? hour.pack ?? hour.tasks);
-  if (role === 'Picking') return num(hour.picks ?? hour.pick ?? hour.tasks);
-  return 0;
-}
-
-function userHourlyStats(user, role) {
-  const hours = Array.isArray(user.hours) ? user.hours : [];
-  const currentHour = londonHourKey();
-  let completedTotal = 0;
-  let completedHours = 0;
-  let peakTotal = 0;
-  let peakHour = null;
-
-  for (const hour of hours) {
-    const value = hourlyCountForRole(hour, role);
-    if (value <= 0) continue;
-
-    if (value > peakTotal) {
-      peakTotal = value;
-      peakHour = hourLabel(hour.timestamp);
-    }
-
-    const d = new Date(hour.timestamp);
-    const isCurrentHour = !Number.isNaN(d.getTime()) && londonHourKey(d) === currentHour;
-    if (!isCurrentHour) {
-      completedTotal += value;
-      completedHours += 1;
+function shiftFields(body) {
+  const kind = body.kind || 'work';
+  requireThat(KINDS.includes(kind), 'Choose a valid shift type.');
+  const working = ['work', 'training'].includes(kind);
+  const start_time = working ? body.start_time : null;
+  const end_time = working ? body.end_time : null;
+  const break_minutes = working ? integer(Number(body.break_minutes ?? 0), 0, 240, 'Break length') : 0;
+  const break_start = working && break_minutes > 0 && body.break_start ? body.break_start : null;
+  if (working) {
+    const start = timeMinutes(start_time), end = timeMinutes(end_time);
+    requireThat(start !== end, 'Start and finish must be different. Overnight shifts finish the following day.');
+    const duration = (end - start + 1440) % 1440;
+    requireThat(break_minutes < duration, 'The break must be shorter than the shift.');
+    if (break_start) {
+      const offset = (timeMinutes(break_start) - start + 1440) % 1440;
+      requireThat(offset + break_minutes <= duration, 'The timed break must fit completely inside the shift.');
     }
   }
-
   return {
-    avgPerHour: completedHours ? completedTotal / completedHours : null,
-    activeHours: completedHours,
-    completedHourlyTotal: completedTotal,
-    peakTotal: peakTotal || null,
-    peakHour
+    kind, start_time, end_time, break_minutes, break_start,
+    label: textValue(body.label || ({ holiday: 'Holiday', sick: 'Sick', unavailable: 'Unavailable' })[kind] || 'Shift', 'Shift name', 60),
+    colour: COLOURS.includes(body.colour) ? body.colour : 'blue',
+    note: textValue(body.note || '', 'Manager note', 500, true)
   };
 }
+function csvCell(value) {
+  let result = String(value ?? '');
+  if (/^[=+@\-\t\r]/.test(result)) result = `'${result}`;
+  return `"${result.replaceAll('"', '""')}"`;
+}
 
-function parseLeaderboard(raw) {
-  const users = Array.isArray(raw?.users) ? raw.users : Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : [];
-  const picking = [];
-  const packing = [];
-  const hourlyMap = new Map();
-  let packedToday = 0;
-
-  for (const user of users) {
-    const role = userRole(user);
-    const name = userName(user);
-    const picks = pickCount(user);
-    const packs = packCount(user);
-    packedToday += packs;
-    if (role === 'Picking' || picks > 0) picking.push({ name, total: picks, ...userHourlyStats(user, 'Picking') });
-    if (role === 'Packing' || packs > 0) packing.push({ name, total: packs, ...userHourlyStats(user, 'Packing') });
-
-    for (const h of Array.isArray(user.hours) ? user.hours : []) {
-      const label = hourLabel(h.timestamp);
-      if (!label) continue;
-      const current = hourlyMap.get(label) || { hour: label, picking: 0, packing: 0 };
-      current.packing += num(h.packs ?? h.pack ?? (role === 'Packing' ? h.tasks : 0));
-      current.picking += num(h.picks ?? h.pick ?? (role === 'Picking' ? h.tasks : 0));
-      hourlyMap.set(label, current);
+export function createRotaServer(options = {}) {
+  const password = options.password ?? process.env.ADMIN_PASSWORD;
+  requireThat(typeof password === 'string' && password.length >= 12, 'Set ADMIN_PASSWORD to a password containing at least 12 characters.', 500);
+  if (process.env.RENDER === 'true') requireThat(process.env.DATA_DIR && path.isAbsolute(process.env.DATA_DIR), 'Set DATA_DIR to the mount path of your Render persistent disk.', 500);
+  const dataDir = path.resolve(options.dataDir ?? process.env.DATA_DIR ?? path.join(ROOT, 'data'));
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const db = new DatabaseSync(path.join(dataDir, 'rota.sqlite'));
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
+    CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    INSERT OR IGNORE INTO meta VALUES ('revision', '0');
+    INSERT OR IGNORE INTO meta VALUES ('schema_version', '1');
+    CREATE TABLE IF NOT EXISTS locations (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, share_token TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS people (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, team TEXT NOT NULL, role TEXT NOT NULL DEFAULT '',
+      contract_minutes INTEGER NOT NULL DEFAULT 0, location_id TEXT NOT NULL REFERENCES locations(id),
+      active INTEGER NOT NULL DEFAULT 1, row_order INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS templates (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+      break_minutes INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'work', colour TEXT NOT NULL DEFAULT 'blue'
+    );
+    CREATE TABLE IF NOT EXISTS shifts (
+      id TEXT PRIMARY KEY, person_id TEXT NOT NULL REFERENCES people(id), location_id TEXT NOT NULL REFERENCES locations(id),
+      date TEXT NOT NULL, start_time TEXT, end_time TEXT, break_minutes INTEGER NOT NULL DEFAULT 0,
+      kind TEXT NOT NULL, label TEXT NOT NULL, colour TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_shifts_date_location ON shifts(date, location_id);
+    CREATE INDEX IF NOT EXISTS idx_shifts_person_date ON shifts(person_id, date);
+    CREATE TABLE IF NOT EXISTS publications (
+      location_id TEXT NOT NULL REFERENCES locations(id), week TEXT NOT NULL,
+      snapshot TEXT NOT NULL, published_at TEXT NOT NULL, PRIMARY KEY (location_id, week)
+    );
+    CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, password_fingerprint TEXT NOT NULL);
+  `);
+  const schemaVersion = Number(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value);
+  requireThat(schemaVersion <= 4, 'This database needs a newer version of the rota app.', 500);
+  if (schemaVersion < 2) {
+    // Keep the original assignments and QR tokens. Old warehouse assignments
+    // stay unset until a manager chooses them; never guess where someone works.
+    if (db.prepare('SELECT COUNT(*) AS n FROM people').get().n > 0) {
+      const backupDir = path.join(dataDir, 'backups');
+      fs.mkdirSync(backupDir, { recursive: true });
+      const destination = path.join(backupDir, 'rota-before-schema-2.sqlite');
+      if (!fs.existsSync(destination)) db.prepare('VACUUM INTO ?').run(destination);
     }
+    db.exec(`BEGIN IMMEDIATE;
+      ALTER TABLE people ADD COLUMN default_department TEXT NOT NULL DEFAULT '';
+      ALTER TABLE shifts ADD COLUMN department TEXT NOT NULL DEFAULT '';
+      ALTER TABLE shifts ADD COLUMN warehouse TEXT NOT NULL DEFAULT '';
+      UPDATE people SET default_department = team WHERE team IN ('Picking', 'Engraving', 'Packing');
+      UPDATE shifts SET department = COALESCE((SELECT default_department FROM people WHERE people.id = shifts.person_id), '');
+      UPDATE meta SET value = '2' WHERE key = 'schema_version';
+      UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
+      COMMIT;`);
   }
-
-  const sortDesc = (a, b) => b.total - a.total;
-  const hourly = [...hourlyMap.values()].sort((a, b) => a.hour.localeCompare(b.hour));
-  return {
-    packedToday,
-    picking: picking.filter(x => x.total > 0).sort(sortDesc).slice(0, 8),
-    packing: packing.filter(x => x.total > 0).sort(sortDesc).slice(0, 8),
-    hourly,
-    rawUserCount: users.length
-  };
-}
-
-function parseOrderCreatedAt(value) {
-  if (value === null || value === undefined || value === '') return null;
-  if (typeof value === 'number' || /^\d+(?:\.\d+)?$/.test(String(value))) {
-    const n = Number(value);
-    const ms = n < 1e12 ? n * 1000 : n;
-    const d = new Date(ms);
-    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  if (schemaVersion < 3) {
+    if (db.prepare('SELECT COUNT(*) AS n FROM people').get().n > 0) {
+      const dir = path.join(dataDir, 'backups'); fs.mkdirSync(dir, { recursive: true });
+      const destination = path.join(dir, 'rota-before-schema-3.sqlite');
+      if (!fs.existsSync(destination)) db.prepare('VACUUM INTO ?').run(destination);
+    }
+    db.exec(`BEGIN IMMEDIATE;
+      ALTER TABLE shifts ADD COLUMN break_start TEXT;
+      ALTER TABLE templates ADD COLUMN break_start TEXT;
+      ALTER TABLE people ADD COLUMN leaderboard_name TEXT NOT NULL DEFAULT '';
+      ALTER TABLE people ADD COLUMN is_example INTEGER NOT NULL DEFAULT 0;
+      UPDATE meta SET value = '3' WHERE key = 'schema_version';
+      UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
+      COMMIT;`);
   }
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
-}
-
-function oldestOrderInfo(raw) {
-  const orders = Array.isArray(raw?.orders) ? raw.orders : Array.isArray(raw?.data?.orders) ? raw.data.orders : [];
-  const first = orders[0];
-  if (!first) return { oldestOutstandingAt: null, oldestOutstandingReference: null };
-  return {
-    oldestOutstandingAt: parseOrderCreatedAt(first.created_at ?? first.createdAt),
-    oldestOutstandingReference: first.reference ?? first.id ?? null
-  };
-}
-
-
-function localDateForInstant(value) {
-  const d = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: APP_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit'
-  }).format(d);
-}
-
-function parseEventTimestamp(value) {
-  if (value === null || value === undefined || value === '') return null;
-  if (typeof value === 'number' || /^\d+(?:\.\d+)?$/.test(String(value))) {
-    const n = Number(value);
-    const ms = n < 1e12 ? n * 1000 : n;
-    const d = new Date(ms);
-    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  if (schemaVersion < 4) {
+    if (db.prepare('SELECT COUNT(*) AS n FROM people').get().n > 0) {
+      const dir = path.join(dataDir, 'backups'); fs.mkdirSync(dir, { recursive: true });
+      const destination = path.join(dir, 'rota-before-schema-4.sqlite');
+      if (!fs.existsSync(destination)) db.prepare('VACUUM INTO ?').run(destination);
+    }
+    db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE attendance (
+        person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        location_id TEXT NOT NULL REFERENCES locations(id), date TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('checked_in', 'no_show')), marked_at TEXT NOT NULL,
+        PRIMARY KEY (person_id, location_id, date)
+      );
+      CREATE TABLE day_plans (
+        location_id TEXT NOT NULL REFERENCES locations(id), date TEXT NOT NULL,
+        budget_minutes INTEGER CHECK(budget_minutes >= 0), requirement_minutes INTEGER CHECK(requirement_minutes >= 0),
+        PRIMARY KEY (location_id, date)
+      );
+      UPDATE meta SET value = '4' WHERE key = 'schema_version';
+      UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
+      COMMIT;`);
   }
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
-}
-
-function extractOrders(raw) {
-  if (Array.isArray(raw?.orders)) return raw.orders;
-  if (Array.isArray(raw?.data?.orders)) return raw.data.orders;
-  if (Array.isArray(raw?.data)) return raw.data;
-  if (Array.isArray(raw)) return raw;
-  return [];
-}
-
-function extractNextCursor(raw) {
-  return raw?.pagination?.next_cursor
-    ?? raw?.pagination?.cursor
-    ?? raw?.next_cursor
-    ?? raw?.next?.cursor
-    ?? raw?.page?.next_cursor
-    ?? null;
-}
-
-function hasNextPage(raw) {
-  return raw?.next_page === true
-    || raw?.pagination?.next_page === true
-    || raw?.pagination?.has_next === true
-    || Boolean(extractNextCursor(raw));
-}
-
-let currentWaitCache = { loadedAt: 0, createdAts: [], pages: 0, error: null };
-let currentWaitRefreshPromise = null;
-
-async function refreshCurrentOutstandingOrders({ force = false } = {}) {
-  const fresh = currentWaitCache.loadedAt && (Date.now() - currentWaitCache.loadedAt < CURRENT_WAIT_REFRESH_MS);
-  if (!force && fresh) return currentWaitCache;
-  if (currentWaitRefreshPromise) return currentWaitRefreshPromise;
-
-  currentWaitRefreshPromise = (async () => {
-    const createdAts = [];
-    let cursor = '';
-    let pages = 0;
-    try {
-      for (let page = 0; page < 100; page++) {
-        const raw = await hutchPost('/orders/List', {
-          is_search: false,
-          filters: [{ field: 'status', op: 7, values: ['Pending', 'Picked', 'Blocked'] }],
-          pagination: { order_by: 'created_at', direction: 1, limit: 50, cursor }
-        });
-        pages += 1;
-        const orders = extractOrders(raw);
-        for (const order of orders) {
-          const createdAt = parseOrderCreatedAt(order?.created_at ?? order?.createdAt);
-          if (createdAt) createdAts.push(createdAt);
-        }
-        if (!orders.length) break;
-        const nextCursor = extractNextCursor(raw);
-        if (!hasNextPage(raw) || !nextCursor || String(nextCursor) === String(cursor)) break;
-        cursor = String(nextCursor);
+  if (!db.prepare('SELECT id FROM locations LIMIT 1').get()) {
+    db.prepare('INSERT INTO locations (id, name, share_token) VALUES (?, ?, ?)').run(uuid(), 'Warehouse', token());
+  }
+  if (!db.prepare("SELECT value FROM meta WHERE key = 'starter_colleagues'").get()) {
+    if (options.seedExamples !== false && !db.prepare('SELECT id FROM people LIMIT 1').get()) {
+      const loc = db.prepare('SELECT id FROM locations LIMIT 1').get();
+      const insert = db.prepare('INSERT INTO people (id, name, team, location_id, row_order, default_department, is_example) VALUES (?, ?, ?, ?, ?, ?, 1)');
+      for (let i = 0; i < 10; i++) {
+        const department = DEPARTMENTS[i % 3];
+        insert.run(uuid(), `Example Colleague ${String(i + 1).padStart(2, '0')}`, department, loc.id, i, department);
       }
-      currentWaitCache = { loadedAt: Date.now(), createdAts, pages, error: null };
-    } catch (error) {
-      currentWaitCache = { ...currentWaitCache, pages, error: error.message };
-      if (!currentWaitCache.createdAts.length) throw error;
     }
-    return currentWaitCache;
-  })();
-  try { return await currentWaitRefreshPromise; }
-  finally { currentWaitRefreshPromise = null; }
-}
-
-async function currentOutstandingWaitSummary() {
-  if (DEMO_MODE) return {
-    averageSeconds: 4 * 3600 + 12 * 60,
-    orders: 176,
-    refreshedAt: new Date().toISOString(),
-    refreshMinutes: 5,
-    statuses: ['Pending', 'Picked', 'Blocked']
-  };
-  const cache = await refreshCurrentOutstandingOrders();
-  const now = Date.now();
-  const waits = cache.createdAts
-    .map(value => Math.max(0, Math.round((now - Date.parse(value)) / 1000)))
-    .filter(Number.isFinite);
-  return {
-    averageSeconds: waits.length ? waits.reduce((a, b) => a + b, 0) / waits.length : null,
-    orders: waits.length,
-    waits,
-    refreshedAt: cache.loadedAt ? new Date(cache.loadedAt).toISOString() : null,
-    refreshMinutes: Math.round(CURRENT_WAIT_REFRESH_MS / 60000),
-    statuses: ['Pending', 'Picked', 'Blocked'],
-    pages: cache.pages,
-    error: cache.error
-  };
-}
-
-function restrictedMeanTimeToDispatch(completedSeconds, openSeconds) {
-  const observations = [
-    ...completedSeconds.map(time => ({ time: Number(time), event: 1 })),
-    ...openSeconds.map(time => ({ time: Number(time), event: 0 }))
-  ].filter(row => Number.isFinite(row.time) && row.time >= 0)
-    .sort((a, b) => a.time - b.time || b.event - a.event);
-
-  if (!observations.length) return { estimatedSeconds: null, horizonSeconds: null, survivalAtHorizon: null };
-
-  let atRisk = observations.length;
-  let survival = 1;
-  let area = 0;
-  let previousTime = 0;
-  let index = 0;
-
-  while (index < observations.length && atRisk > 0) {
-    const time = observations[index].time;
-    area += survival * Math.max(0, time - previousTime);
-
-    let events = 0;
-    let censored = 0;
-    while (index < observations.length && observations[index].time === time) {
-      if (observations[index].event) events += 1;
-      else censored += 1;
-      index += 1;
-    }
-
-    if (events > 0 && atRisk > 0) survival *= Math.max(0, 1 - events / atRisk);
-    atRisk -= events + censored;
-    previousTime = time;
+    db.prepare("INSERT INTO meta VALUES ('starter_colleagues', '1')").run();
   }
-
-  return {
-    estimatedSeconds: area,
-    horizonSeconds: previousTime,
-    survivalAtHorizon: survival
+  const salt = randomBytes(16);
+  const passwordHash = scryptSync(password, salt, 32);
+  const passwordFingerprint = hash(password);
+  const demo = options.demo === true;
+  const dashboardSetting = key => process.env[key.toUpperCase()] || db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value || '';
+  const dashboard = createDashboardReader({ getURL: () => dashboardSetting('dashboard_url'), getKey: () => dashboardSetting('dashboard_api_key'), allowLocal: options.allowLocalDashboard === true, fetch: options.dashboardFetch });
+  const attempts = new Map();
+  const revision = () => Number(db.prepare("SELECT value FROM meta WHERE key = 'revision'").get().value);
+  const location = id => {
+    const row = db.prepare('SELECT * FROM locations WHERE id = ?').get(id);
+    requireThat(row, 'Location not found.', 404);
+    return row;
   };
-}
-
-async function currentEstimatedDispatchSummary() {
-  if (DEMO_MODE) return {
-    estimatedSeconds: 8 * 3600 + 18 * 60,
-    shippedOrders: 684,
-    openOrders: 257,
-    totalOrders: 941,
-    ordersBeyondEstimate: 23,
-    windowHours: 72,
-    method: 'censored-rmst',
-    refreshedAt: new Date().toISOString(),
-    openRefreshMinutes: 5,
-    shippedRefreshMinutes: Math.round(CYCLE_REFRESH_INTERVAL_MS / 60000)
+  const person = id => {
+    const row = db.prepare('SELECT * FROM people WHERE id = ?').get(id);
+    requireThat(row, 'Colleague not found.', 404);
+    return row;
   };
-
-  const [records, outstanding] = await Promise.all([
-    readCycleRecords(),
-    currentOutstandingWaitSummary()
-  ]);
-
-  const now = Date.now();
-  const cutoff = now - 72 * 3600 * 1000;
-  const recentShipped = records.filter(record => {
-    const shippedMs = Date.parse(record.shippedAt || '');
-    return Number.isFinite(shippedMs) && shippedMs >= cutoff && shippedMs <= now;
-  });
-  const completedSeconds = recentShipped
-    .map(record => Number(record.cycleSeconds))
-    .filter(value => Number.isFinite(value) && value >= 0);
-  const openSeconds = Array.isArray(outstanding.waits) ? outstanding.waits : [];
-  const estimate = restrictedMeanTimeToDispatch(completedSeconds, openSeconds);
-  const estimatedSeconds = estimate.estimatedSeconds;
-  const ordersBeyondEstimate = Number.isFinite(estimatedSeconds)
-    ? openSeconds.filter(wait => wait > estimatedSeconds).length
-    : 0;
-
-  return {
-    estimatedSeconds,
-    shippedOrders: completedSeconds.length,
-    openOrders: openSeconds.length,
-    totalOrders: completedSeconds.length + openSeconds.length,
-    ordersBeyondEstimate,
-    windowHours: 72,
-    method: 'censored-rmst',
-    horizonSeconds: estimate.horizonSeconds,
-    survivalAtHorizon: estimate.survivalAtHorizon,
-    refreshedAt: outstanding.refreshedAt,
-    openRefreshMinutes: outstanding.refreshMinutes,
-    shippedRefreshMinutes: Math.round(CYCLE_REFRESH_INTERVAL_MS / 60000),
-    openError: outstanding.error || null
-  };
-}
-
-async function readCycleRecords() {
-  try {
-    const parsed = JSON.parse(await fs.readFile(CYCLE_FILE, 'utf8'));
-    return Array.isArray(parsed) ? parsed : [];
-  } catch { return []; }
-}
-
-async function saveCycleRecords(records) {
-  const tmp = `${CYCLE_FILE}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(records, null, 2) + '\n');
-  await fs.rename(tmp, CYCLE_FILE);
-}
-
-function percentile(sorted, p) {
-  if (!sorted.length) return null;
-  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1));
-  return sorted[index];
-}
-
-function cycleMetrics(records) {
-  const values = records.map(r => num(r.cycleSeconds)).filter(v => v >= 0 && Number.isFinite(v)).sort((a, b) => a - b);
-  if (!values.length) return { averageSeconds: null, medianSeconds: null, p90Seconds: null, orders: 0 };
-  const total = values.reduce((a, b) => a + b, 0);
-  return {
-    averageSeconds: total / values.length,
-    medianSeconds: percentile(values, 0.5),
-    p90Seconds: percentile(values, 0.9),
-    orders: values.length
-  };
-}
-
-async function cycleSummaryForDate(date) {
-  const records = await readCycleRecords();
-  return cycleMetrics(records.filter(r => r.shippedDate === date));
-}
-
-async function cycleSummaryForRollingDays(endDate, days = 7) {
-  const safeDays = Math.max(1, Math.floor(Number(days) || 7));
-  const startDate = dateOnlyAdd(endDate, -(safeDays - 1));
-  const records = await cycleRecordsForRange(startDate, endDate);
-  return { ...cycleMetrics(records), startDate, endDate, windowDays: safeDays };
-}
-
-async function cycleRecordsForRange(start, end) {
-  const records = await readCycleRecords();
-  return records.filter(r => r.shippedDate && r.shippedDate >= start && r.shippedDate <= end);
-}
-
-function shippedEventFromTimeline(raw) {
-  const events = Array.isArray(raw?.events) ? raw.events : Array.isArray(raw?.data?.events) ? raw.data.events : [];
-  const matches = events.filter(event => String(event?.title || '').toLowerCase().includes('status updated to shipped'));
-  if (!matches.length) return null;
-  return matches.reduce((latest, event) => {
-    const iso = parseEventTimestamp(event.timestamp);
-    if (!iso) return latest;
-    if (!latest || Date.parse(iso) > Date.parse(latest.shippedAt)) return { shippedAt: iso, title: event.title || '' };
-    return latest;
-  }, null);
-}
-
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-async function hutchPostWithBackoff(endpoint, payload) {
-  let lastError;
-  for (let attempt = 0; attempt <= CYCLE_BACKOFF_MS.length; attempt++) {
-    try { return await hutchPost(endpoint, payload); }
-    catch (error) {
-      lastError = error;
-      const retryable = error?.status === 429 || Number(error?.status) >= 500;
-      if (!retryable || attempt >= CYCLE_BACKOFF_MS.length) throw error;
-      const waitMs = CYCLE_BACKOFF_MS[attempt];
-      console.warn(`Hutch ${error.status} on ${endpoint}; backing off for ${Math.round(waitMs / 1000)}s`);
-      await sleep(waitMs);
-    }
-  }
-  throw lastError;
-}
-
-let cycleRefreshPromise = null;
-let cycleLastAttemptAt = null;
-let cycleLastSuccessAt = null;
-let cycleLastError = null;
-let cycleLastNewRecords = 0;
-let cycleLastScannedOrders = 0;
-let cycleLastPages = 0;
-let cycleBackfillCompleted = false;
-let cycleBackfillStartedAt = null;
-let cycleBackfillCompletedAt = null;
-let cycleBackfillProcessed = 0;
-let cycleBackfillFailed = 0;
-let cycleBackfillTarget = 0;
-let cycleReconcileCompleted = false;
-let cycleReconcileStartedAt = null;
-let cycleReconcileCompletedAt = null;
-let cycleReconcileProcessed = 0;
-let cycleReconcileFailed = 0;
-let cycleReconcileTarget = 0;
-let cycleReconcileScannedOrders = 0;
-let cycleReconcilePages = 0;
-
-async function loadCycleRefreshState() {
-  try {
-    const state = JSON.parse(await fs.readFile(CYCLE_STATE_FILE, 'utf8'));
-    cycleLastAttemptAt = state.lastAttemptAt || null;
-    cycleLastSuccessAt = state.lastSuccessAt || null;
-    cycleLastError = state.lastError || null;
-    cycleLastNewRecords = num(state.newRecords);
-    cycleLastScannedOrders = num(state.scannedOrders);
-    cycleLastPages = num(state.pages);
-    cycleBackfillCompleted = state.backfillCompleted === true;
-    cycleBackfillStartedAt = state.backfillStartedAt || null;
-    cycleBackfillCompletedAt = state.backfillCompletedAt || null;
-    cycleBackfillProcessed = num(state.backfillProcessed);
-    cycleBackfillFailed = num(state.backfillFailed);
-    cycleBackfillTarget = num(state.backfillTarget);
-    cycleReconcileCompleted = state.reconcileCompleted === true;
-    cycleReconcileStartedAt = state.reconcileStartedAt || null;
-    cycleReconcileCompletedAt = state.reconcileCompletedAt || null;
-    cycleReconcileProcessed = num(state.reconcileProcessed);
-    cycleReconcileFailed = num(state.reconcileFailed);
-    cycleReconcileTarget = num(state.reconcileTarget);
-    cycleReconcileScannedOrders = num(state.reconcileScannedOrders);
-    cycleReconcilePages = num(state.reconcilePages);
-  } catch {}
-}
-
-async function saveCycleRefreshState() {
-  const state = {
-    lastAttemptAt: cycleLastAttemptAt,
-    lastSuccessAt: cycleLastSuccessAt,
-    lastError: cycleLastError,
-    newRecords: cycleLastNewRecords,
-    scannedOrders: cycleLastScannedOrders,
-    pages: cycleLastPages,
-    backfillCompleted: cycleBackfillCompleted,
-    backfillStartedAt: cycleBackfillStartedAt,
-    backfillCompletedAt: cycleBackfillCompletedAt,
-    backfillProcessed: cycleBackfillProcessed,
-    backfillFailed: cycleBackfillFailed,
-    backfillTarget: cycleBackfillTarget,
-    reconcileCompleted: cycleReconcileCompleted,
-    reconcileStartedAt: cycleReconcileStartedAt,
-    reconcileCompletedAt: cycleReconcileCompletedAt,
-    reconcileProcessed: cycleReconcileProcessed,
-    reconcileFailed: cycleReconcileFailed,
-    reconcileTarget: cycleReconcileTarget,
-    reconcileScannedOrders: cycleReconcileScannedOrders,
-    reconcilePages: cycleReconcilePages
-  };
-  const tmp = `${CYCLE_STATE_FILE}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2) + '\n');
-  await fs.rename(tmp, CYCLE_STATE_FILE);
-}
-
-function cycleRefreshDue() {
-  const last = Date.parse(cycleLastSuccessAt || cycleLastAttemptAt || '');
-  return !Number.isFinite(last) || (Date.now() - last >= CYCLE_REFRESH_INTERVAL_MS);
-}
-
-async function refreshCycleTimes({ force = false, backfill = false, reconcile = false } = {}) {
-  if (DEMO_MODE) return false;
-  if (!backfill && !reconcile && !force && !cycleRefreshDue()) return false;
-  if (cycleRefreshPromise) return cycleRefreshPromise;
-
-  cycleRefreshPromise = (async () => {
-    cycleLastAttemptAt = new Date().toISOString();
-    cycleLastError = null;
-    if (backfill && !cycleBackfillStartedAt) cycleBackfillStartedAt = cycleLastAttemptAt;
-    if (reconcile && !cycleReconcileStartedAt) cycleReconcileStartedAt = cycleLastAttemptAt;
-    await saveCycleRefreshState();
-
-    const existing = await readCycleRecords();
-    const byId = new Map(existing.map(r => [String(r.orderId), r]));
-    const candidates = [];
-    let cursor = '';
-    let pages = 0;
-    let scanned = 0;
-    const maxPages = reconcile ? CYCLE_RECONCILE_MAX_PAGES : backfill ? CYCLE_BACKFILL_MAX_PAGES : CYCLE_MAX_PAGES;
-    const maxNew = reconcile ? CYCLE_RECONCILE_MAX_NEW_TIMELINES : backfill ? CYCLE_BACKFILL_MAX_NEW_TIMELINES : CYCLE_MAX_NEW_TIMELINES;
-
-    try {
-      for (let page = 0; page < maxPages; page++) {
-        const raw = await hutchPostWithBackoff('/orders/List', {
-          is_search: false,
-          filters: [{ field: 'status', op: 7, values: ['Shipped'] }],
-          pagination: { order_by: 'created_at', direction: 0, limit: 50, cursor }
-        });
-        pages += 1;
-        const orders = extractOrders(raw);
-        if (!orders.length) break;
-        scanned += orders.length;
-        for (const order of orders) {
-          const orderId = String(order?.id ?? order?.order_id ?? '');
-          if (!orderId || byId.has(orderId)) continue;
-          const createdAt = parseOrderCreatedAt(order?.created_at ?? order?.createdAt);
-          if (!createdAt) continue;
-          candidates.push({ orderId, reference: order?.reference ?? null, createdAt });
-          if (candidates.length >= maxNew) break;
-        }
-        if (candidates.length >= maxNew) break;
-        const nextCursor = extractNextCursor(raw);
-        if (!hasNextPage(raw) || !nextCursor || String(nextCursor) === String(cursor)) break;
-        cursor = String(nextCursor);
-      }
-
-      if (backfill) {
-        cycleBackfillTarget = candidates.length;
-        cycleBackfillProcessed = 0;
-        cycleBackfillFailed = 0;
-        await saveCycleRefreshState();
-      } else if (reconcile) {
-        cycleReconcileTarget = candidates.length;
-        cycleReconcileProcessed = 0;
-        cycleReconcileFailed = 0;
-        cycleReconcileScannedOrders = scanned;
-        cycleReconcilePages = pages;
-        await saveCycleRefreshState();
-      }
-
-      let added = 0;
-      let processedThisRun = 0;
-      let failedThisRun = 0;
-
-      for (let index = 0; index < candidates.length; index++) {
-        const order = candidates[index];
-        try {
-          const timeline = await hutchPostWithBackoff('/orders/Timeline', { id: order.orderId });
-          const shipped = shippedEventFromTimeline(timeline);
-          if (shipped) {
-            const createdMs = Date.parse(order.createdAt);
-            const shippedMs = Date.parse(shipped.shippedAt);
-            if (Number.isFinite(createdMs) && Number.isFinite(shippedMs) && shippedMs >= createdMs) {
-              byId.set(String(order.orderId), {
-                orderId: order.orderId,
-                reference: order.reference,
-                createdAt: order.createdAt,
-                shippedAt: shipped.shippedAt,
-                shippedDate: localDateForInstant(shipped.shippedAt),
-                cycleSeconds: Math.round((shippedMs - createdMs) / 1000),
-                eventTitle: shipped.title,
-                recordedAt: new Date().toISOString()
-              });
-              added += 1;
-            }
-          }
-        } catch (error) {
-          failedThisRun += 1;
-          console.warn(`Cycle timeline skipped for ${order.orderId}: ${error.message}`);
-        }
-
-        processedThisRun += 1;
-        if (backfill) {
-          cycleBackfillProcessed = processedThisRun;
-          cycleBackfillFailed = failedThisRun;
-        } else if (reconcile) {
-          cycleReconcileProcessed = processedThisRun;
-          cycleReconcileFailed = failedThisRun;
-        }
-
-        if (processedThisRun % 10 === 0 || index === candidates.length - 1) {
-          await saveCycleRecords([...byId.values()].sort((a, b) => String(a.shippedAt).localeCompare(String(b.shippedAt))));
-          await saveCycleRefreshState();
-        }
-
-        if (index < candidates.length - 1) await sleep(CYCLE_TIMELINE_DELAY_MS);
-      }
-
-      cycleLastNewRecords = added;
-      cycleLastScannedOrders = scanned;
-      cycleLastPages = pages;
-      cycleLastSuccessAt = new Date().toISOString();
-      if (backfill) {
-        cycleBackfillCompleted = true;
-        cycleBackfillCompletedAt = cycleLastSuccessAt;
-      } else if (reconcile) {
-        cycleReconcileScannedOrders = scanned;
-        cycleReconcilePages = pages;
-        // A failed Timeline request is retried by a later reconciliation pass;
-        // successful orders are already cached and will not be requested again.
-        cycleReconcileCompleted = failedThisRun === 0;
-        cycleReconcileCompletedAt = cycleReconcileCompleted ? cycleLastSuccessAt : null;
-      }
-      await saveCycleRefreshState();
-      return true;
-    } catch (error) {
-      cycleLastError = error.message;
-      await saveCycleRefreshState().catch(() => {});
-      const mode = reconcile ? 'reconciliation' : backfill ? 'backfill' : 'refresh';
-      console.error(`Cycle-time ${mode} failed:`, error.message);
-      return false;
-    }
-  })();
-
-  try { return await cycleRefreshPromise; }
-  finally { cycleRefreshPromise = null; }
-}
-
-function cycleRefreshStatus() {
-  return {
-    lastAttemptAt: cycleLastAttemptAt,
-    lastSuccessAt: cycleLastSuccessAt,
-    lastError: cycleLastError,
-    newRecords: cycleLastNewRecords,
-    scannedOrders: cycleLastScannedOrders,
-    pages: cycleLastPages,
-    refreshMinutes: Math.round(CYCLE_REFRESH_INTERVAL_MS / 60000),
-    timelineDelaySeconds: Math.round(CYCLE_TIMELINE_DELAY_MS / 1000),
-    backfill: {
-      completed: cycleBackfillCompleted,
-      startedAt: cycleBackfillStartedAt,
-      completedAt: cycleBackfillCompletedAt,
-      processed: cycleBackfillProcessed,
-      failed: cycleBackfillFailed,
-      target: cycleBackfillTarget,
-      maxOrders: CYCLE_BACKFILL_MAX_NEW_TIMELINES
-    },
-    reconciliation: {
-      completed: cycleReconcileCompleted,
-      startedAt: cycleReconcileStartedAt,
-      completedAt: cycleReconcileCompletedAt,
-      processed: cycleReconcileProcessed,
-      failed: cycleReconcileFailed,
-      target: cycleReconcileTarget,
-      scannedOrders: cycleReconcileScannedOrders,
-      pages: cycleReconcilePages,
-      maxPages: CYCLE_RECONCILE_MAX_PAGES,
-      maxOrders: CYCLE_RECONCILE_MAX_NEW_TIMELINES,
-      retryMinutes: Math.round(CYCLE_RECONCILE_RETRY_MS / 60000)
-    }
-  };
-}
-
-function demoData(target) {
-  const packedToday = 1318;
-  return {
-    date: londonDateParts().iso,
-    target,
-    packedToday,
-    remainingToTarget: Math.max(target - packedToday, 0),
-    progressPct: target > 0 ? Math.min((packedToday / target) * 100, 100) : 0,
-    remainingToPick: 102,
-    remainingToPack: 72,
-    onHold: 10,
-    priorityOrders: 7,
-    dpdToPick: 48,
-    dpdToPack: 31,
-    royalMailToPick: 54,
-    royalMailToPack: 41,
-    oldestOutstandingAt: new Date(Date.now() - 2 * 86400000).toISOString(),
-    cycleTime: { averageSeconds: 4680, medianSeconds: 3300, p90Seconds: 9900, orders: 184, windowDays: 7, startDate: dateOnlyAdd(londonDateParts().iso, -6), endDate: londonDateParts().iso },
-    currentWait: { averageSeconds: 15120, orders: 176, waits: [9000, 12000, 18000], refreshedAt: new Date().toISOString(), refreshMinutes: 5, statuses: ['Pending', 'Picked', 'Blocked'] },
-    dispatchEstimate: { estimatedSeconds: 29880, shippedOrders: 684, openOrders: 257, totalOrders: 941, ordersBeyondEstimate: 23, windowHours: 72, method: 'censored-rmst', refreshedAt: new Date().toISOString(), openRefreshMinutes: 5, shippedRefreshMinutes: 180 },
-    picking: [
-      { name: 'Finn Buckley', total: 127, avgPerHour: 31.8, peakTotal: 52, peakHour: '08:00' },
-      { name: 'Zack Manea', total: 79, avgPerHour: 26.3, peakTotal: 48, peakHour: '08:00' },
-      { name: 'Callum Robson', total: 64, avgPerHour: 21.3, peakTotal: 33, peakHour: '10:00' },
-      { name: 'Jamie', total: 58, avgPerHour: 19.3, peakTotal: 27, peakHour: '11:00' },
-      { name: 'Alex', total: 51, avgPerHour: 17.0, peakTotal: 24, peakHour: '09:00' }
-    ],
-    packing: [
-      { name: 'Felicia Prenger', total: 121, avgPerHour: 20.2, peakTotal: 31, peakHour: '10:00' },
-      { name: 'Olivia Steward', total: 117, avgPerHour: 23.4, peakTotal: 45, peakHour: '12:00' },
-      { name: 'Ryan', total: 108, avgPerHour: 21.6, peakTotal: 34, peakHour: '11:00' },
-      { name: 'Chloe', total: 96, avgPerHour: 19.2, peakTotal: 29, peakHour: '14:00' },
-      { name: 'Sarah', total: 91, avgPerHour: 18.2, peakTotal: 27, peakHour: '13:00' }
-    ],
-    hourly: [
-      { hour: '08:00', picking: 114, packing: 17 },
-      { hour: '09:00', picking: 0, packing: 36 },
-      { hour: '10:00', picking: 5, packing: 71 },
-      { hour: '11:00', picking: 0, packing: 84 },
-      { hour: '12:00', picking: 4, packing: 32 },
-      { hour: '13:00', picking: 0, packing: 26 },
-      { hour: '14:00', picking: 12, packing: 29 },
-      { hour: '15:00', picking: 51, packing: 19 }
-    ],
-    version: 'v6.0',
-    mode: 'demo',
-    updatedAt: new Date().toISOString()
-  };
-}
-
-async function dashboardData() {
-  const date = londonDateParts().iso;
-  const targets = await getTargets();
-  const target = num(targets[date]) || DEFAULT_TARGET;
-  if (DEMO_MODE) return demoData(target);
-
-  const statusPending = { field: 'status', op: 7, values: ['Pending'] };
-  const statusPicked = { field: 'status', op: 7, values: ['Picked'] };
-  const statusBlocked = { field: 'status', op: 7, values: ['Blocked'] };
-  const dpd = { field: 'shipping_method', op: 7, values: ['DeliveryUKNextDayTracked'] };
-  const royalMail = { field: 'shipping_method', op: 7, values: ['DeliveryUKFirstClassTracked'] };
-  const priority = { field: 'priority', op: 1, values: ['true'] };
-  const outstandingStatuses = { field: 'status', op: 7, values: ['Pending', 'Picked'] };
-
-  const [leaderboardRaw, pickRaw, packRaw, holdRaw, priorityRaw, dpdPickRaw, dpdPackRaw, royalPickRaw, royalPackRaw, oldestRaw] = await Promise.all([
-    hutchPost('/admin/Leaderboard', { date: hutchDatePayload() }),
-    hutchPost('/orders/Count', { filters: [statusPending] }),
-    hutchPost('/orders/Count', { filters: [statusPicked] }),
-    hutchPost('/orders/Count', { filters: [statusBlocked] }),
-    hutchPost('/orders/Count', { filters: [outstandingStatuses, priority] }),
-    hutchPost('/orders/Count', { filters: [statusPending, dpd] }),
-    hutchPost('/orders/Count', { filters: [statusPicked, dpd] }),
-    hutchPost('/orders/Count', { filters: [statusPending, royalMail] }),
-    hutchPost('/orders/Count', { filters: [statusPicked, royalMail] }),
-    hutchPost('/orders/List', {
-      is_search: false,
-      filters: [outstandingStatuses],
-      pagination: { order_by: 'created_at', direction: 1, limit: 1, cursor: '' }
-    })
-  ]);
-
-  const leaderboard = parseLeaderboard(leaderboardRaw);
-  const oldest = oldestOrderInfo(oldestRaw);
-  const packedToday = leaderboard.packedToday;
-  const [cycleTime, currentWait, dispatchEstimate] = await Promise.all([
-    cycleSummaryForRollingDays(date, 7),
-    currentOutstandingWaitSummary(),
-    currentEstimatedDispatchSummary()
-  ]);
-  return {
-    date,
-    target,
-    packedToday,
-    remainingToTarget: Math.max(target - packedToday, 0),
-    progressPct: target > 0 ? Math.min((packedToday / target) * 100, 100) : 0,
-    remainingToPick: num(pickRaw?.count),
-    remainingToPack: num(packRaw?.count),
-    onHold: num(holdRaw?.count),
-    priorityOrders: num(priorityRaw?.count),
-    dpdToPick: num(dpdPickRaw?.count),
-    dpdToPack: num(dpdPackRaw?.count),
-    royalMailToPick: num(royalPickRaw?.count),
-    royalMailToPack: num(royalPackRaw?.count),
-    oldestOutstandingAt: oldest.oldestOutstandingAt,
-    oldestOutstandingReference: oldest.oldestOutstandingReference,
-    cycleTime,
-    currentWait,
-    dispatchEstimate,
-    cycleRefresh: cycleRefreshStatus(),
-    picking: leaderboard.picking,
-    packing: leaderboard.packing,
-    hourly: leaderboard.hourly,
-    version: 'v6.0',
-    mode: 'live',
-    authStatus: HUTCH_REFRESH_TOKEN ? 'auto-refresh' : 'access-token',
-    updatedAt: new Date().toISOString(),
-    diagnostics: { users: leaderboard.rawUserCount, lastRefreshAt }
-  };
-}
-
-
-function dateOnlyAdd(isoDate, days) {
-  const d = new Date(`${isoDate}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().slice(0, 10);
-}
-
-function dateOnlyDiffDays(a, b) {
-  return Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86400000);
-}
-
-function localClockParts(date = new Date()) {
-  const parts = new Intl.DateTimeFormat('en-GB', {
-    timeZone: APP_TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, hourCycle: 'h23'
-  }).formatToParts(date).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
-  return {
-    date: `${parts.year}-${parts.month}-${parts.day}`,
-    time: `${parts.hour}:${parts.minute}`,
-    second: `${parts.hour}:${parts.minute}:${parts.second}`,
-    hour: parts.hour,
-    minute: parts.minute
-  };
-}
-
-function historyFile(date) {
-  return path.join(HISTORY_DIR, `${date}.jsonl`);
-}
-
-async function readSnapshots(date) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(date || ''))) return [];
-  try {
-    const raw = await fs.readFile(historyFile(date), 'utf8');
-    return raw.split('\n').filter(Boolean).map(line => {
-      try { return JSON.parse(line); } catch { return null; }
-    }).filter(Boolean).sort((a, b) => String(a.capturedAt).localeCompare(String(b.capturedAt)));
-  } catch { return []; }
-}
-
-function minutesFromTime(value) {
-  const m = /^(\d{2}):(\d{2})/.exec(String(value || ''));
-  return m ? Number(m[1]) * 60 + Number(m[2]) : 0;
-}
-
-function snapshotAtOrBefore(snapshots, time) {
-  if (!snapshots.length) return null;
-  const target = minutesFromTime(time);
-  const before = snapshots.filter(s => minutesFromTime(s.localTime) <= target);
-  return before.length ? before[before.length - 1] : snapshots[0];
-}
-
-function snapshotNearest(snapshots, time) {
-  if (!snapshots.length) return null;
-  const target = minutesFromTime(time);
-  return snapshots.reduce((best, s) => {
-    if (!best) return s;
-    return Math.abs(minutesFromTime(s.localTime) - target) < Math.abs(minutesFromTime(best.localTime) - target) ? s : best;
-  }, null);
-}
-
-async function appendSnapshot(data) {
-  const now = new Date();
-  const local = localClockParts(now);
-  const bucketMinute = Math.floor(Number(local.minute) / 5) * 5;
-  const bucket = `${local.date}T${local.hour}:${String(bucketMinute).padStart(2, '0')}`;
-  const snapshots = await readSnapshots(local.date);
-  if (snapshots.at(-1)?.bucket === bucket) return false;
-
-  const snapshot = {
-    ...data,
-    capturedAt: now.toISOString(),
-    localDate: local.date,
-    localTime: local.second,
-    bucket
-  };
-  await fs.appendFile(historyFile(local.date), JSON.stringify(snapshot) + '\n');
-  return true;
-}
-
-let snapshotInProgress = false;
-async function captureSnapshot() {
-  if (snapshotInProgress || DEMO_MODE) return;
-  snapshotInProgress = true;
-  try {
-    const data = await dashboardData();
-    if (await appendSnapshot(data)) console.log(`Saved warehouse snapshot ${localClockParts().date} ${localClockParts().time}`);
-  } catch (error) {
-    console.error('Snapshot capture failed:', error.message);
-  } finally {
-    snapshotInProgress = false;
-  }
-}
-
-async function historyDates() {
-  try {
-    const files = await fs.readdir(HISTORY_DIR);
-    return files.filter(f => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).map(f => f.slice(0, 10)).sort();
-  } catch { return []; }
-}
-
-function dailyPersonBest(snapshots, roleKey) {
-  const map = new Map();
-  for (const snap of snapshots) {
-    for (const row of Array.isArray(snap[roleKey]) ? snap[roleKey] : []) {
-      const current = map.get(row.name);
-      if (!current || num(row.total) > num(current.total)) map.set(row.name, row);
-    }
-  }
-  return [...map.values()];
-}
-
-function aggregateWeeklyPeople(days, roleKey) {
-  const map = new Map();
-  for (const day of days) {
-    for (const row of dailyPersonBest(day.snapshots, roleKey)) {
-      const current = map.get(row.name) || { name: row.name, total: 0, completedHourlyTotal: 0, activeHours: 0, peakTotal: 0, peakHour: null, peakDate: null };
-      current.total += num(row.total);
-      current.completedHourlyTotal += num(row.completedHourlyTotal);
-      current.activeHours += num(row.activeHours);
-      if (num(row.peakTotal) > num(current.peakTotal)) {
-        current.peakTotal = num(row.peakTotal);
-        current.peakHour = row.peakHour || null;
-        current.peakDate = day.date;
-      }
-      map.set(row.name, current);
-    }
-  }
-  return [...map.values()].map(row => ({
-    ...row,
-    avgPerHour: row.activeHours ? row.completedHourlyTotal / row.activeHours : null
-  })).sort((a, b) => b.total - a.total).slice(0, 10);
-}
-
-function finalHourlyForDay(snapshots) {
-  let best = null;
-  for (const snap of snapshots) {
-    if (!best || num(snap.packedToday) >= num(best.packedToday)) best = snap;
-  }
-  return Array.isArray(best?.hourly) ? best.hourly : [];
-}
-
-function previousWeekStart() {
-  const today = londonDateParts().iso;
-  const d = new Date(`${today}T00:00:00Z`);
-  const mondayOffset = (d.getUTCDay() + 6) % 7;
-  d.setUTCDate(d.getUTCDate() - mondayOffset - 7);
-  return d.toISOString().slice(0, 10);
-}
-
-function dayLabel(date) {
-  return new Intl.DateTimeFormat('en-GB', { weekday: 'short', day: '2-digit', month: 'short', timeZone: 'UTC' }).format(new Date(`${date}T00:00:00Z`));
-}
-
-async function weeklyData(weekStart) {
-  const start = /^\d{4}-\d{2}-\d{2}$/.test(String(weekStart || '')) ? weekStart : previousWeekStart();
-  const days = [];
-  for (let i = 0; i < 7; i++) {
-    const date = dateOnlyAdd(start, i);
-    const snapshots = await readSnapshots(date);
-    const actual = snapshots.length ? Math.max(...snapshots.map(s => num(s.packedToday))) : null;
-    const last = snapshots.at(-1) || null;
-    const target = last ? num(last.target) : null;
-    days.push({ date, label: dayLabel(date), snapshots, actual, target });
-  }
-
-  const recorded = days.filter(d => d.snapshots.length);
-  const daily = days.map(d => ({ date: d.date, label: d.label, dispatched: d.actual, target: d.target }));
-  const totalDispatched = recorded.reduce((sum, d) => sum + num(d.actual), 0);
-  const averageDaily = recorded.length ? totalDispatched / recorded.length : 0;
-  const targetAchievedDays = recorded.filter(d => num(d.actual) >= num(d.target) && num(d.target) > 0).length;
-  const peakDayRaw = recorded.reduce((best, d) => !best || num(d.actual) > num(best.actual) ? d : best, null);
-
-  const hourlyMap = new Map();
-  for (const d of recorded) {
-    for (const h of finalHourlyForDay(d.snapshots)) {
-      const row = hourlyMap.get(h.hour) || { hour: h.hour, picking: 0, packing: 0 };
-      row.picking += num(h.picking);
-      row.packing += num(h.packing);
-      hourlyMap.set(h.hour, row);
-    }
-  }
-
-  const benchmarkTimes = ['09:00', '12:00', '15:00', '18:00'];
-  const backlogBenchmarks = benchmarkTimes.map(time => {
-    const samples = recorded.map(d => snapshotNearest(d.snapshots, time)).filter(Boolean);
+  function snapshot(locationId, week) {
+    const loc = location(locationId);
+    const shifts = db.prepare('SELECT * FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ? ORDER BY date, person_id, start_time, id').all(locationId, week, addDays(week, 6));
+    const ids = new Set(shifts.map(s => s.person_id));
+    const people = db.prepare('SELECT * FROM people ORDER BY team COLLATE NOCASE, row_order, name COLLATE NOCASE, id').all()
+      .filter(p => (p.active && p.location_id === locationId) || ids.has(p.id))
+      .map(({ id, name, team, default_department, role, row_order, is_example }) => ({ id, name, team, default_department, role, row_order, is_example }));
     return {
-      time,
-      days: samples.length,
-      toPick: samples.length ? samples.reduce((a, s) => a + num(s.remainingToPick), 0) / samples.length : null,
-      toPack: samples.length ? samples.reduce((a, s) => a + num(s.remainingToPack), 0) / samples.length : null
+      location: { id: loc.id, name: loc.name }, week, people,
+      departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      // Absence reasons and daily manager records do not go on the shared rota.
+      shifts: shifts.map(({ note, ...shift }) => shift.kind === 'sick' ? { ...shift, kind: 'unavailable', label: 'Unavailable' } : shift)
     };
-  });
-
-  const cycleRecords = await cycleRecordsForRange(start, dateOnlyAdd(start, 6));
-  const cycleTime = cycleMetrics(cycleRecords);
-  const cycleDaily = days.map(d => ({
-    date: d.date,
-    label: d.label,
-    ...cycleMetrics(cycleRecords.filter(r => r.shippedDate === d.date))
-  }));
-
-  return {
-    version: 'v6.0',
-    weekStart: start,
-    weekEnd: dateOnlyAdd(start, 6),
-    daysWithData: recorded.length,
-    totalDispatched,
-    averageDaily,
-    targetAchievedDays,
-    peakDay: peakDayRaw ? { date: peakDayRaw.date, label: peakDayRaw.label, dispatched: peakDayRaw.actual } : null,
-    daily,
-    picking: aggregateWeeklyPeople(recorded, 'picking'),
-    packing: aggregateWeeklyPeople(recorded, 'packing'),
-    hourly: [...hourlyMap.values()].sort((a, b) => String(a.hour).localeCompare(String(b.hour))),
-    backlogBenchmarks,
-    cycleTime,
-    cycleDaily
-  };
-}
-
-const mimeTypes = {
-  '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-  '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon'
-};
-
-async function serveStatic(req, res) {
-  let pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
-  if (pathname === '/') pathname = '/index.html';
-  const safePath = path.normalize(pathname).replace(/^\.\.(\/|\\|$)/, '');
-  const filePath = path.join(PUBLIC_DIR, safePath);
-  if (!filePath.startsWith(PUBLIC_DIR)) return false;
-  try {
-    const stat = await fs.stat(filePath);
-    if (!stat.isFile()) return false;
-    const data = await fs.readFile(filePath);
-    const cacheControl = path.extname(filePath) === '.html' ? 'no-store, max-age=0' : 'no-cache, max-age=0';
-    res.writeHead(200, { 'Content-Type': mimeTypes[path.extname(filePath)] || 'application/octet-stream', 'Cache-Control': cacheControl });
-    res.end(data);
-    return true;
-  } catch { return false; }
-}
-
-const server = http.createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    if (req.method === 'GET' && url.pathname === '/api/dashboard') {
-      try { return json(res, 200, await dashboardData()); }
-      catch (error) {
-        return json(res, error.status === 401 ? 401 : 502, {
-          error: 'Unable to read Hutch data',
-          message: error.message,
-          code: error.code || 'HUTCH_ERROR',
-          hint: error.status === 401
-            ? (HUTCH_REFRESH_TOKEN ? 'Hutch automatic refresh failed. A new Hutch sign-in may be required.' : 'The Hutch access token expired. Configure HUTCH_REFRESH_TOKEN for automatic renewal, or sign in again and update HUTCH_BEARER_TOKEN.')
-            : 'Check network access and Hutch API availability.'
-        });
-      }
-    }
-    if (req.method === 'GET' && url.pathname === '/api/history/dates') {
-      return json(res, 200, { dates: await historyDates(), snapshotIntervalMinutes: Math.round(SNAPSHOT_INTERVAL_MS / 60000) });
-    }
-    if (req.method === 'GET' && url.pathname === '/api/history') {
-      const date = String(url.searchParams.get('date') || '');
-      const time = String(url.searchParams.get('time') || '12:00');
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) return json(res, 400, { error: 'Invalid date or time' });
-      const snapshots = await readSnapshots(date);
-      const selected = snapshotAtOrBefore(snapshots, time);
-      const previousDate = dateOnlyAdd(date, -1);
-      const previousSnapshots = await readSnapshots(previousDate);
-      const previous = snapshotAtOrBefore(previousSnapshots, time);
-      return json(res, 200, {
-        version: 'v6.0',
-        date,
-        requestedTime: time,
-        selected,
-        comparison: previous ? { date: previousDate, snapshot: previous } : null,
-        availableSnapshots: snapshots.length,
-        snapshotIntervalMinutes: Math.round(SNAPSHOT_INTERVAL_MS / 60000)
-      });
-    }
-    if (req.method === 'GET' && url.pathname === '/api/weekly') {
-      return json(res, 200, await weeklyData(url.searchParams.get('weekStart')));
-    }
-    if (req.method === 'GET' && url.pathname === '/api/cycle-time') {
-      const date = String(url.searchParams.get('date') || londonDateParts().iso);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return json(res, 400, { error: 'Invalid date' });
-      return json(res, 200, { version: 'v6.0', date, cycleTime: await cycleSummaryForDate(date), refresh: cycleRefreshStatus() });
-    }
-    if (req.method === 'POST' && url.pathname === '/api/target') {
-      const body = await readBody(req);
-      const date = String(body.date || londonDateParts().iso);
-      const target = Math.round(num(body.target));
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || target < 1 || target > 1000000) {
-        return json(res, 400, { error: 'Invalid date or target' });
-      }
-      await saveTarget(date, target);
-      return json(res, 200, { ok: true, date, target });
-    }
-    if (req.method === 'GET' && url.pathname === '/api/health') {
-      return json(res, 200, {
-        ok: true,
-        version: 'v6.0',
-        mode: DEMO_MODE ? 'demo' : 'live',
-        authMode: HUTCH_REFRESH_TOKEN ? 'refresh-token' : (hutchAccessToken ? 'access-token' : 'none'),
-        accessTokenLoaded: Boolean(hutchAccessToken),
-        refreshTokenConfigured: Boolean(HUTCH_REFRESH_TOKEN),
-        lastRefreshAt,
-        historyEnabled: true,
-        snapshotIntervalMinutes: Math.round(SNAPSHOT_INTERVAL_MS / 60000),
-        historyDirectory: HISTORY_DIR,
-        timezone: APP_TIMEZONE,
-        cycleTimeTracking: true,
-        cycleRefreshMinutes: Math.round(CYCLE_REFRESH_INTERVAL_MS / 60000),
-        cycleRefresh: cycleRefreshStatus()
-      });
-    }
-    if (await serveStatic(req, res)) return;
-    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Not found');
-  } catch (error) {
-    json(res, 500, { error: 'Server error', message: error.message });
   }
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Dylan Oaks Warehouse Dashboard running at http://localhost:${PORT}`);
-  if (DEMO_MODE) console.log('Mode: DEMO (set HUTCH_BEARER_TOKEN or HUTCH_REFRESH_TOKEN for live data)');
-  else if (HUTCH_REFRESH_TOKEN) console.log('Mode: LIVE Hutch API (automatic token refresh enabled)');
-  else console.log('Mode: LIVE Hutch API (access token only)');
-});
-
-
-if (!DEMO_MODE) {
-  // Take one snapshot shortly after startup, then every five minutes.
-  setTimeout(() => captureSnapshot(), 10000);
-  const delay = SNAPSHOT_INTERVAL_MS - (Date.now() % SNAPSHOT_INTERVAL_MS) + 2500;
-  setTimeout(() => {
-    captureSnapshot();
-    setInterval(captureSnapshot, SNAPSHOT_INTERVAL_MS);
-  }, delay);
+  function state(week) {
+    const publications = db.prepare('SELECT * FROM publications WHERE week = ?').all(week).map(p => ({
+      location_id: p.location_id, week: p.week, published_at: p.published_at,
+      dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
+    }));
+    return {
+      revision: revision(), week, demo, build: 'rota-week-controls-20261004', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
+      dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
+      locations: db.prepare('SELECT id, name, share_token, active FROM locations ORDER BY active DESC, name COLLATE NOCASE').all(),
+      people: db.prepare('SELECT * FROM people ORDER BY team COLLATE NOCASE, row_order, name COLLATE NOCASE, id').all(),
+      templates: db.prepare('SELECT * FROM templates ORDER BY name COLLATE NOCASE').all(),
+      shifts: db.prepare('SELECT * FROM shifts WHERE date BETWEEN ? AND ? ORDER BY date, start_time, id').all(week, addDays(week, 6)),
+      attendance: db.prepare('SELECT * FROM attendance WHERE date BETWEEN ? AND ? ORDER BY date, person_id').all(week, addDays(week, 6)),
+      dayPlans: db.prepare('SELECT location_id, date, requirement_minutes FROM day_plans WHERE date BETWEEN ? AND ? AND requirement_minutes IS NOT NULL ORDER BY date, location_id').all(week, addDays(week, 6)),
+      publications
+    };
+  }
+  function validateShift(body, skipId, additional = [], allowUnassigned = false) {
+    const p = person(body.person_id), loc = location(body.location_id);
+    requireThat(p.active && loc.active, 'Reactivate this colleague or location before assigning shifts.');
+    const shift = { id: skipId || uuid(), person_id: p.id, location_id: loc.id, date: dateValue(body.date), ...shiftFields(body) };
+    const working = ['work', 'training'].includes(shift.kind);
+    shift.department = body.department === undefined ? p.default_department : body.department;
+    shift.warehouse = body.warehouse ?? '';
+    shift.colour = ({ Picking: 'blue', Engraving: 'violet', Packing: 'teal' })[shift.department] || shift.colour;
+    requireThat(DEPARTMENTS.includes(shift.department) || (shift.department === '' && (!working || allowUnassigned)), `${p.name}: choose Picking, Engraving or Packing for this shift, or set a default department.`);
+    requireThat(WAREHOUSES.includes(shift.warehouse) || (shift.warehouse === '' && (!working || allowUnassigned)), 'Choose Warehouse 1 or Warehouse 2 for this shift.');
+    const existing = db.prepare('SELECT * FROM shifts WHERE person_id = ? AND date BETWEEN ? AND ?').all(p.id, addDays(shift.date, -1), addDays(shift.date, 1));
+    const conflict = [...existing, ...additional].find(s => s.id !== skipId && overlaps(s, shift));
+    requireThat(!conflict, `${p.name} already has an overlapping shift or absence on ${conflict?.date || shift.date}.`, 422);
+    return shift;
+  }
+  const insertShift = db.prepare('INSERT INTO shifts (id, person_id, location_id, date, start_time, end_time, break_minutes, kind, label, colour, note, department, warehouse, break_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const shiftArgs = s => [s.id, s.person_id, s.location_id, s.date, s.start_time, s.end_time, s.break_minutes, s.kind, s.label, s.colour, s.note, s.department, s.warehouse, s.break_start];
+  function savePerson(body, id) {
+    const loc = location(body.location_id);
+    requireThat(loc.active || id, 'Choose an active location.');
+    const name = textValue(body.name, 'Colleague name', 120);
+    const existing = id ? person(id) : null;
+    const defaultDepartment = body.default_department ?? (body.team === undefined ? existing?.default_department || '' : DEPARTMENTS.includes(body.team) ? body.team : '');
+    requireThat(defaultDepartment === '' || DEPARTMENTS.includes(defaultDepartment), 'Choose Picking, Engraving or Packing as the default department, or leave it unset.');
+    const team = textValue(body.team || defaultDepartment || existing?.team || 'Warehouse', 'Team', 60);
+    const role = textValue(body.role || '', 'Role', 80, true);
+    const leaderboardName = textValue(body.leaderboard_name ?? existing?.leaderboard_name ?? '', 'Dashboard name', 120, true);
+    const isExample = body.is_example === false || body.is_example === 0 ? 0 : existing?.is_example || 0;
+    const hours = Number(body.contract_hours ?? 0);
+    requireThat(Number.isFinite(hours) && hours >= 0 && hours <= 100, 'Contracted hours must be between 0 and 100. Leave this at 0 if not applicable.');
+    const active = body.active === false || body.active === 0 ? 0 : 1;
+    if (id) {
+      db.prepare('UPDATE people SET name = ?, team = ?, role = ?, contract_minutes = ?, location_id = ?, active = ?, default_department = ?, leaderboard_name = ?, is_example = ? WHERE id = ?')
+        .run(name, team, role, Math.round(hours * 60), loc.id, active, defaultDepartment, leaderboardName, isExample, id);
+      return id;
+    }
+    const newId = uuid();
+    const order = db.prepare('SELECT COALESCE(MAX(row_order), 0) + 1 AS n FROM people').get().n;
+    db.prepare('INSERT INTO people (id, name, team, role, contract_minutes, location_id, active, row_order, default_department, leaderboard_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(newId, name, team, role, Math.round(hours * 60), loc.id, active, order, defaultDepartment, leaderboardName);
+    return newId;
+  }
+  function backupFile(destination) {
+    db.prepare('VACUUM INTO ?').run(destination);
+  }
+  function dailyBackup() {
+    const dir = path.join(dataDir, 'backups');
+    fs.mkdirSync(dir, { recursive: true });
+    const filename = `rota-${new Date().toISOString().slice(0, 10)}.sqlite`;
+    const destination = path.join(dir, filename);
+    if (!fs.existsSync(destination)) backupFile(destination);
+    const files = fs.readdirSync(dir).filter(f => /^rota-\d{4}-\d{2}-\d{2}\.sqlite$/.test(f)).sort().reverse();
+    for (const old of files.slice(7)) fs.unlinkSync(path.join(dir, old));
+  }
+  dailyBackup();
+  const backupTimer = setInterval(() => { try { dailyBackup(); } catch (error) { console.error('Daily backup failed:', error.message); } }, 60 * 60 * 1000);
+  backupTimer.unref();
+  function authenticated(req) {
+    const cookie = (req.headers.cookie || '').split(';').map(v => v.trim()).find(v => v.startsWith('rota_session='));
+    if (!cookie) return false;
+    const value = cookie.slice('rota_session='.length);
+    if (!/^[A-Za-z0-9_-]{43}$/.test(value)) return false;
+    const session = db.prepare('SELECT * FROM sessions WHERE token_hash = ?').get(hash(value));
+    return Boolean(session && session.expires_at > Date.now() && session.password_fingerprint === passwordFingerprint);
+  }
+  function commonHeaders(res) {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  }
+  function send(res, status, body, type = 'application/json; charset=utf-8') {
+    commonHeaders(res);
+    res.writeHead(status, { 'Content-Type': type });
+    res.end(type.startsWith('application/json') ? JSON.stringify(body) : body);
+  }
+  async function readBody(req) {
+    requireThat((req.headers['content-type'] || '').startsWith('application/json'), 'Send application/json.', 415);
+    const chunks = []; let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      requireThat(size <= 512000, 'The request is too large.', 413);
+      chunks.push(chunk);
+    }
+    try {
+      const result = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+      requireThat(result && typeof result === 'object' && !Array.isArray(result), 'Send a JSON object.');
+      return result;
+    } catch (error) {
+      if (error instanceof Problem) throw error;
+      throw new Problem(400, 'The request could not be read.');
+    }
+  }
+  function csrf(req) {
+    requireThat(req.headers['x-rota-request'] === '1', 'Refresh the page and try again.', 403);
+    if (req.headers.origin) {
+      let origin;
+      try { origin = new URL(req.headers.origin); } catch { throw new Problem(403, 'Request origin not allowed.'); }
+      const allowed = new Set([req.headers.host, process.env.RENDER_EXTERNAL_HOSTNAME]);
+      if (process.env.PUBLIC_URL) allowed.add(new URL(process.env.PUBLIC_URL).host);
+      requireThat(allowed.has(origin.host), 'Request origin not allowed.', 403);
+    }
+  }
+  function mutation(req, callback) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      requireThat(req.headers['if-match'] === String(revision()), 'The rota changed in another window. The latest version has been loaded; review it and try again.', 409);
+      const result = callback();
+      db.prepare("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision'").run();
+      db.exec('COMMIT');
+      return { ...result, revision: revision() };
+    } catch (error) { db.exec('ROLLBACK'); throw error; }
+  }
+  function siteOrigin(req) {
+    if (process.env.PUBLIC_URL) return new URL(process.env.PUBLIC_URL).origin;
+    if (process.env.RENDER_EXTERNAL_HOSTNAME) return `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`;
+    return `http://${req.headers.host}`;
+  }
+  async function sharePDF(res, loc, url) {
+    const week = weekValue(url.searchParams.get('week') || monday());
+    const publication = db.prepare('SELECT * FROM publications WHERE location_id = ? AND week = ?').get(loc.id, week);
+    requireThat(publication, 'Publish this week before sharing a PDF.', 404);
+    const layout = url.searchParams.get('layout') || 'overview';
+    const warehouse = url.searchParams.get('warehouse') || '', department = url.searchParams.get('department') || '';
+    requireThat(['warehouse', 'department', 'az', 'overview'].includes(layout), 'Choose a valid PDF layout.');
+    requireThat(!warehouse || WAREHOUSES.includes(warehouse), 'Choose Warehouse 1 or Warehouse 2.');
+    requireThat(!department || DEPARTMENTS.includes(department), 'Choose a valid department.');
+    const pdf = await rotaPDF(JSON.parse(publication.snapshot), { layout, warehouse, department, published_at: publication.published_at });
+    res.setHeader('Content-Disposition', `attachment; filename="warehouse-rota-${week}-${layout}.pdf"`);
+    return send(res, 200, pdf, 'application/pdf');
+  }
+  const server = http.createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url, 'http://localhost');
+      const pathname = url.pathname;
+      const method = req.method;
+      if (method === 'GET' && pathname === '/health') return send(res, 200, { status: 'ok' });
+      if (method === 'GET' && pathname === '/api/session') return send(res, 200, { authenticated: authenticated(req) });
+      if (method === 'POST' && pathname === '/api/login') {
+        csrf(req);
+        const body = await readBody(req);
+        const ip = process.env.RENDER === 'true' ? (req.headers['x-forwarded-for'] || req.socket.remoteAddress).split(',').at(-1).trim() : req.socket.remoteAddress;
+        const key = hash(ip || 'unknown');
+        for (const [key, value] of attempts) if (value.until < Date.now()) attempts.delete(key);
+        const attempt = attempts.get(key) || { count: 0, until: Date.now() + 15 * 60 * 1000 };
+        requireThat(attempt.count < 10, 'Too many login attempts. Try again in 15 minutes.', 429);
+        requireThat(typeof body.password === 'string' && body.password.length <= 256, 'Enter your manager password.', 401);
+        const candidate = scryptSync(body.password, salt, 32);
+        if (!timingSafeEqual(candidate, passwordHash)) {
+          attempt.count++; attempts.set(key, attempt);
+          throw new Problem(401, 'That password was not recognised.');
+        }
+        attempts.delete(key);
+        db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(Date.now());
+        const sessionToken = token();
+        db.prepare('INSERT INTO sessions VALUES (?, ?, ?)').run(hash(sessionToken), Date.now() + SESSION_MS, passwordFingerprint);
+        const secure = process.env.NODE_ENV === 'production' || siteOrigin(req).startsWith('https:');
+        res.setHeader('Set-Cookie', `rota_session=${sessionToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200${secure ? '; Secure' : ''}`);
+        return send(res, 200, { ok: true });
+      }
+      if (method === 'GET' && /^\/api\/public\/[^/]+\/pdf$/.test(pathname)) {
+        const loc = db.prepare('SELECT id FROM locations WHERE share_token = ?').get(pathname.split('/')[3]);
+        requireThat(loc, 'This rota link is no longer available.', 404);
+        return await sharePDF(res, loc, url);
+      }
+      if (method === 'GET' && pathname.startsWith('/api/public/')) {
+        const shareToken = pathname.slice('/api/public/'.length);
+        const loc = db.prepare('SELECT id, name FROM locations WHERE share_token = ?').get(shareToken);
+        requireThat(loc, 'This rota link is no longer available. Ask your manager for the current link.', 404);
+        const weeks = db.prepare('SELECT week, published_at FROM publications WHERE location_id = ? ORDER BY week').all(loc.id);
+        const current = monday();
+        const requested = url.searchParams.get('week');
+        const week = requested ? weekValue(requested) : weeks.find(w => w.week === current)?.week || weeks.find(w => w.week > current)?.week || weeks.at(-1)?.week || current;
+        const publication = db.prepare('SELECT * FROM publications WHERE location_id = ? AND week = ?').get(loc.id, week);
+        return send(res, 200, publication ? { ...JSON.parse(publication.snapshot), published_at: publication.published_at, weeks, readOnly: true, demo } : { location: loc, week, people: [], shifts: [], weeks, readOnly: true, unpublished: true, demo });
+      }
+      if (pathname.startsWith('/api/')) {
+        requireThat(authenticated(req), 'Sign in to manage the rota.', 401);
+        if (method === 'POST' && pathname === '/api/logout') {
+          csrf(req);
+          const cookie = (req.headers.cookie || '').match(/(?:^|;\s*)rota_session=([^;]+)/);
+          if (cookie) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hash(cookie[1]));
+          res.setHeader('Set-Cookie', 'rota_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+          return send(res, 200, { ok: true });
+        }
+        if (method === 'GET' && pathname === '/api/state') return send(res, 200, state(weekValue(url.searchParams.get('week') || monday())));
+        if (method === 'GET' && /^\/api\/people\/[^/]+\/performance$/.test(pathname)) {
+          const colleague = person(pathname.split('/')[3]);
+          const requestedWeek = url.searchParams.get('week');
+          const requestedDate = url.searchParams.get('date');
+          requireThat(!(requestedWeek && requestedDate), 'Choose a rota week or a single performance date.');
+          if (requestedWeek) {
+            const week = weekValue(requestedWeek);
+            const loc = location(url.searchParams.get('locationId') || colleague.location_id);
+            const shifts = db.prepare('SELECT person_id, date, start_time, end_time, kind FROM shifts WHERE person_id = ? AND location_id = ? AND date BETWEEN ? AND ? ORDER BY date, start_time').all(colleague.id, loc.id, week, addDays(week, 6));
+            try { return send(res, 200, await dashboard.weeklyProfile(colleague, shifts, week)); }
+            catch (error) { if (error instanceof Problem) throw error; throw new Problem(502, error.message); }
+          }
+          const date = requestedDate ? dateValue(requestedDate) : '';
+          requireThat(!date || date <= today(), 'Choose a performance date up to today.');
+          try { return send(res, 200, await dashboard.profile(colleague, date)); }
+          catch (error) { if (error instanceof Problem) throw error; throw new Problem(502, error.message); }
+        }
+        if (method === 'GET' && pathname === '/api/export.pdf') return await sharePDF(res, location(url.searchParams.get('locationId')), url);
+        if (method === 'GET' && pathname === '/api/qr.svg') {
+          const loc = location(url.searchParams.get('locationId'));
+          const svg = await QRCode.toString(`${siteOrigin(req)}/rota/${loc.share_token}`, { type: 'svg', width: 360, margin: 4, errorCorrectionLevel: 'M' });
+          return send(res, 200, svg, 'image/svg+xml');
+        }
+        if (method === 'GET' && pathname === '/api/export.csv') {
+          const loc = location(url.searchParams.get('locationId'));
+          const week = weekValue(url.searchParams.get('week'));
+          const snap = snapshot(loc.id, week);
+          const draftShifts = db.prepare('SELECT * FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ? ORDER BY date, person_id, start_time, id').all(loc.id, week, addDays(week, 6));
+          const names = new Map(snap.people.map(p => [p.id, p]));
+          const rows = [['Name', 'Default department', 'Department', 'Warehouse', 'Date', 'Shift', 'Start', 'Finish', 'Break starts', 'Unpaid break minutes', 'Scheduled hours', 'Type']];
+          for (const s of draftShifts) rows.push([names.get(s.person_id).name, names.get(s.person_id).default_department, s.department, s.warehouse, s.date, s.label, s.start_time || '', s.end_time || '', s.break_start || '', s.break_minutes, (scheduledMinutes(s) / 60).toFixed(2), s.kind]);
+          res.setHeader('Content-Disposition', `attachment; filename="rota-${week}.csv"`);
+          return send(res, 200, '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n'), 'text/csv; charset=utf-8');
+        }
+        if (method === 'GET' && pathname === '/api/backup') {
+          const destination = path.join(dataDir, `download-${uuid()}.sqlite`);
+          try {
+            backupFile(destination);
+            const contents = fs.readFileSync(destination);
+            res.setHeader('Content-Disposition', `attachment; filename="warehouse-rota-backup-${today()}.sqlite"`);
+            return send(res, 200, contents, 'application/vnd.sqlite3');
+          } finally { if (fs.existsSync(destination)) fs.unlinkSync(destination); }
+        }
+        requireThat(['POST', 'PUT', 'DELETE'].includes(method), 'Endpoint not found.', 404);
+        csrf(req);
+        const body = await readBody(req);
+        const result = mutation(req, () => {
+          if (method === 'POST' && pathname === '/api/attendance') {
+            const p = person(body.person_id), loc = location(body.location_id), date = dateValue(body.date);
+            requireThat(['checked_in', 'no_show', 'unmarked'].includes(body.status), 'Choose checked in, no show or clear attendance.');
+            requireThat(date <= today(), 'Attendance can be marked on the shift date or afterwards.');
+            if (body.status === 'unmarked') {
+              db.prepare('DELETE FROM attendance WHERE person_id = ? AND location_id = ? AND date = ?').run(p.id, loc.id, date);
+              return { cleared: true };
+            }
+            requireThat(db.prepare("SELECT id FROM shifts WHERE person_id = ? AND location_id = ? AND date = ? AND kind IN ('work', 'training') LIMIT 1").get(p.id, loc.id, date), 'Attendance needs a work or training shift on this day.');
+            const marked_at = new Date().toISOString();
+            db.prepare('INSERT INTO attendance VALUES (?, ?, ?, ?, ?) ON CONFLICT(person_id, location_id, date) DO UPDATE SET status = excluded.status, marked_at = excluded.marked_at').run(p.id, loc.id, date, body.status, marked_at);
+            return { status: body.status, marked_at };
+          }
+          if (method === 'POST' && pathname === '/api/day-plans') {
+            const loc = location(body.location_id), date = dateValue(body.date);
+            requireThat(loc.active, 'Reactivate this location before setting daily hours.');
+            const toMinutes = (value, name) => {
+              if (value === null || value === undefined || value === '') return null;
+              requireThat((typeof value === 'number' || typeof value === 'string' && value.trim() !== '') && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 10000, `${name} must be hours between 0 and 10,000, or left blank.`);
+              return Math.round(Number(value) * 60);
+            };
+            const required = toMinutes(body.requirement_hours, 'Required hours');
+            if (required === null) db.prepare('DELETE FROM day_plans WHERE location_id = ? AND date = ?').run(loc.id, date);
+            else db.prepare('INSERT INTO day_plans (location_id, date, budget_minutes, requirement_minutes) VALUES (?, ?, NULL, ?) ON CONFLICT(location_id, date) DO UPDATE SET budget_minutes = NULL, requirement_minutes = excluded.requirement_minutes').run(loc.id, date, required);
+            return { saved: true };
+          }
+          if (method === 'POST' && pathname === '/api/dashboard/settings') {
+            let value;
+            try { value = dashboard.validateURL(body.url || ''); } catch (error) { throw new Problem(400, error.message); }
+            db.prepare('INSERT INTO meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run('dashboard_url', value);
+            if (body.api_key !== undefined) db.prepare('INSERT INTO meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run('dashboard_api_key', textValue(body.api_key, 'Dashboard integration key', 256, true));
+            dashboard.reset(); return { saved: true };
+          }
+          if (method === 'POST' && pathname === '/api/people') return { id: savePerson(body) };
+          if (method === 'PUT' && /^\/api\/people\/[^/]+$/.test(pathname)) return { id: savePerson(body, pathname.split('/').at(-1)) };
+          if (method === 'DELETE' && /^\/api\/people\/[^/]+$/.test(pathname)) {
+            const id = pathname.split('/').at(-1);
+            person(id);
+            requireThat(body.confirm === true, 'Confirm deletion of this colleague and their draft shifts.');
+            const removed = db.prepare('DELETE FROM shifts WHERE person_id = ?').run(id);
+            db.prepare('DELETE FROM people WHERE id = ?').run(id);
+            return { deleted: true, removed_shifts: Number(removed.changes) };
+          }
+          if (method === 'POST' && pathname === '/api/people/import') {
+            location(body.location_id);
+            requireThat(Array.isArray(body.people) && body.people.length > 0 && body.people.length <= 1000, 'Import between 1 and 1,000 colleagues.');
+            const names = new Set(db.prepare('SELECT name FROM people WHERE location_id = ?').all(body.location_id).map(p => p.name.toLocaleLowerCase()));
+            let imported = 0, skipped = 0;
+            for (const p of body.people) {
+              requireThat(p && typeof p === 'object' && !Array.isArray(p), 'Check the colleague rows in the import.');
+              const name = textValue(p.name, 'Colleague name', 120);
+              if (names.has(name.toLocaleLowerCase())) { skipped++; continue; }
+              savePerson({ ...p, name, location_id: body.location_id });
+              names.add(name.toLocaleLowerCase()); imported++;
+            }
+            return { imported, skipped };
+          }
+          if ((method === 'POST' && pathname === '/api/templates') || (method === 'PUT' && /^\/api\/templates\/[^/]+$/.test(pathname))) {
+            const id = method === 'PUT' ? pathname.split('/').at(-1) : uuid();
+            if (method === 'PUT') requireThat(db.prepare('SELECT id FROM templates WHERE id = ?').get(id), 'Shift pattern not found.', 404);
+            const fields = shiftFields({ ...body, label: body.name });
+            requireThat(['work', 'training'].includes(fields.kind), 'Shift patterns must be work or training.');
+            const name = textValue(body.name, 'Pattern name', 60);
+            db.prepare('INSERT INTO templates (id, name, start_time, end_time, break_minutes, kind, colour, break_start) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, start_time = excluded.start_time, end_time = excluded.end_time, break_minutes = excluded.break_minutes, kind = excluded.kind, colour = excluded.colour, break_start = excluded.break_start')
+              .run(id, name, fields.start_time, fields.end_time, fields.break_minutes, fields.kind, fields.colour, fields.break_start);
+            return { id };
+          }
+          if (method === 'DELETE' && /^\/api\/templates\/[^/]+$/.test(pathname)) {
+            const result = db.prepare('DELETE FROM templates WHERE id = ?').run(pathname.split('/').at(-1));
+            requireThat(result.changes, 'Shift pattern not found.', 404); return { deleted: true };
+          }
+          if (method === 'POST' && pathname === '/api/shifts') {
+            const shift = validateShift(body);
+            insertShift.run(...shiftArgs(shift)); return { id: shift.id };
+          }
+          if (method === 'PUT' && /^\/api\/shifts\/[^/]+$/.test(pathname)) {
+            const id = pathname.split('/').at(-1);
+            requireThat(db.prepare('SELECT id FROM shifts WHERE id = ?').get(id), 'Shift not found.', 404);
+            const shift = validateShift(body, id);
+            db.prepare('DELETE FROM shifts WHERE id = ?').run(id);
+            insertShift.run(...shiftArgs(shift)); return { id };
+          }
+          if (method === 'DELETE' && /^\/api\/shifts\/[^/]+$/.test(pathname)) {
+            const result = db.prepare('DELETE FROM shifts WHERE id = ?').run(pathname.split('/').at(-1));
+            requireThat(result.changes, 'Shift not found.', 404); return { deleted: true };
+          }
+          if (method === 'POST' && pathname === '/api/shifts/bulk') {
+            requireThat(Array.isArray(body.person_ids) && body.person_ids.length > 0 && Array.isArray(body.dates) && body.dates.length > 0, 'Choose colleagues and days.');
+            const people = [...new Set(body.person_ids)], dates = [...new Set(body.dates)];
+            requireThat(people.length * dates.length <= 1000, 'Assign at most 1,000 shifts at once.');
+            const pending = [];
+            for (const person_id of people) for (const date of dates) pending.push(validateShift({ ...body, person_id, date }, undefined, pending));
+            for (const shift of pending) insertShift.run(...shiftArgs(shift));
+            return { created: pending.length };
+          }
+          if (method === 'POST' && pathname === '/api/shifts/clear') {
+            const loc = location(body.location_id);
+            requireThat(body.scope === 'day' || body.scope === 'week', 'Choose a day or week to clear.');
+            requireThat(body.confirm === true, 'Confirm clearing these draft shifts.');
+            const start = body.scope === 'day' ? dateValue(body.date) : weekValue(body.week);
+            const end = body.scope === 'day' ? start : addDays(start, 6);
+            // Clear only assignments: recorded attendance, requirements and publications stay saved.
+            const removed = db.prepare('DELETE FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ?').run(loc.id, start, end);
+            return { cleared: true, removed_shifts: Number(removed.changes), scope: body.scope, start_date: start, end_date: end };
+          }
+          if (method === 'POST' && pathname === '/api/weeks/copy') {
+            const loc = location(body.location_id), week = weekValue(body.week);
+            requireThat(loc.active, 'Reactivate this location before copying shifts.');
+            const sourceWeek = addDays(week, -7);
+            const shifts = db.prepare('SELECT * FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ? ORDER BY date').all(loc.id, sourceWeek, addDays(sourceWeek, 6));
+            let copied = 0, skipped = 0;
+            for (const shift of shifts) {
+              if (!person(shift.person_id).active) { skipped++; continue; }
+              try {
+                const next = validateShift({ ...shift, date: addDays(shift.date, 7) }, undefined, [], true);
+                insertShift.run(...shiftArgs(next)); copied++;
+              } catch (error) { if (error.status === 422) skipped++; else throw error; }
+            }
+            return { copied, skipped };
+          }
+          if (method === 'POST' && pathname === '/api/publish') {
+            const loc = location(body.location_id), week = weekValue(body.week);
+            const draft = snapshot(loc.id, week);
+            const incomplete = draft.shifts.find(s => ['work', 'training'].includes(s.kind) && (!DEPARTMENTS.includes(s.department) || !WAREHOUSES.includes(s.warehouse)));
+            requireThat(!incomplete, 'Set a department and warehouse on every work or training shift before publishing.');
+            const snap = JSON.stringify(draft);
+            const published_at = new Date().toISOString();
+            db.prepare('INSERT INTO publications VALUES (?, ?, ?, ?) ON CONFLICT(location_id, week) DO UPDATE SET snapshot = excluded.snapshot, published_at = excluded.published_at').run(loc.id, week, snap, published_at);
+            return { published_at };
+          }
+          if (method === 'DELETE' && pathname === '/api/publish') {
+            const loc = location(body.location_id), week = weekValue(body.week);
+            db.prepare('DELETE FROM publications WHERE location_id = ? AND week = ?').run(loc.id, week); return { unpublished: true };
+          }
+          if (method === 'POST' && pathname === '/api/share/reset') {
+            const loc = location(body.location_id), share_token = token();
+            db.prepare('UPDATE locations SET share_token = ? WHERE id = ?').run(share_token, loc.id);
+            return { share_token };
+          }
+          if ((method === 'POST' && pathname === '/api/locations') || (method === 'PUT' && /^\/api\/locations\/[^/]+$/.test(pathname))) {
+            const name = textValue(body.name, 'Location name', 80);
+            if (method === 'POST') {
+              const id = uuid(); db.prepare('INSERT INTO locations (id, name, share_token) VALUES (?, ?, ?)').run(id, name, token()); return { id };
+            }
+            const id = pathname.split('/').at(-1); location(id);
+            const active = body.active === false || body.active === 0 ? 0 : 1;
+            if (!active) requireThat(db.prepare('SELECT COUNT(*) AS n FROM locations WHERE active = 1 AND id != ?').get(id).n > 0, 'Keep at least one location active.');
+            db.prepare('UPDATE locations SET name = ?, active = ? WHERE id = ?').run(name, active, id); return { id };
+          }
+          throw new Problem(404, 'Endpoint not found.');
+        });
+        return send(res, 200, result);
+      }
+      requireThat(method === 'GET' || method === 'HEAD', 'Method not allowed.', 405);
+      const publicFiles = { '/coverage.js': ['coverage.js', 'text/javascript; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
+      const file = publicFiles[pathname];
+      if (file) return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', file[0])), file[1]);
+      if (pathname === '/' || /^\/rota\/[A-Za-z0-9_-]{43}$/.test(pathname)) return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', 'index.html')), 'text/html; charset=utf-8');
+      return send(res, 404, { error: 'Page not found.' });
+    } catch (error) {
+      if (!(error instanceof Problem)) console.error('Request failed:', error.message);
+      if (!res.headersSent) send(res, error.status || 500, { error: error instanceof Problem ? error.message : 'Something went wrong. Please try again.' });
+      else res.end();
+    }
+  });
+  server.requestTimeout = 30000;
+  server.headersTimeout = 15000;
+  server.keepAliveTimeout = 5000;
+  return { server, db, dataDir, snapshot, close: () => new Promise(resolve => { clearInterval(backupTimer); server.close(() => { db.close(); resolve(); }); server.closeIdleConnections(); }) };
 }
 
-
-if (!DEMO_MODE) {
-  // Build a controlled one-time cache of recent shipped orders, then maintain it every three hours.
-  // Backfill is sequential and deliberately paced to avoid a burst of Timeline requests.
-  await loadCycleRefreshState();
-
-  const scheduleCycleRefresh = () => {
-    const last = Date.parse(cycleLastSuccessAt || cycleLastAttemptAt || '');
-    const dueAt = Number.isFinite(last) ? last + CYCLE_REFRESH_INTERVAL_MS : Date.now() + 5000;
-    const delay = Math.max(5000, dueAt - Date.now());
-    setTimeout(async () => {
-      await refreshCycleTimes();
-      scheduleCycleRefresh();
-    }, delay);
-  };
-
-  const runReconciliation = async () => {
-    if (cycleReconcileCompleted) return;
-    console.log(`Starting one-time deep cycle-time reconciliation: scanning up to ${CYCLE_RECONCILE_MAX_PAGES * 50} shipped orders; only missing orders will request Timeline, one every ${Math.round(CYCLE_TIMELINE_DELAY_MS / 1000)}s.`);
-    await refreshCycleTimes({ force: true, reconcile: true });
-    if (!cycleReconcileCompleted) {
-      console.warn(`Cycle-time reconciliation is incomplete; retrying in ${Math.round(CYCLE_RECONCILE_RETRY_MS / 60000)} minutes. Cached successes will not be requested again.`);
-      setTimeout(runReconciliation, CYCLE_RECONCILE_RETRY_MS);
-    }
-  };
-
-  setTimeout(async () => {
-    if (!cycleBackfillCompleted) {
-      console.log(`Starting controlled cycle-time backfill: up to ${CYCLE_BACKFILL_MAX_NEW_TIMELINES} new orders, one Timeline request every ${Math.round(CYCLE_TIMELINE_DELAY_MS / 1000)}s.`);
-      await refreshCycleTimes({ force: true, backfill: true });
-    }
-
-    // v6 one-time catch-up: go deeper than the normal 2,000-order scan to fill
-    // any gaps caused by older-created orders being shipped recently. This state
-    // is persisted on the Render disk so future deploys do not repeat the scan.
-    if (!cycleReconcileCompleted) await runReconciliation();
-
-    if (cycleRefreshDue()) await refreshCycleTimes();
-    scheduleCycleRefresh();
-  }, 5000);
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (fs.existsSync(path.join(ROOT, '.env'))) process.loadEnvFile(path.join(ROOT, '.env'));
+  try {
+    const app = createRotaServer();
+    const port = Number(process.env.PORT || 3000);
+    app.server.listen(port, '0.0.0.0', () => console.log(`Warehouse rota running on port ${port}`));
+    const stop = () => { app.close().then(() => process.exit(0)); };
+    process.on('SIGTERM', stop); process.on('SIGINT', stop);
+  } catch (error) { console.error(error.message); process.exit(1); }
 }
-
