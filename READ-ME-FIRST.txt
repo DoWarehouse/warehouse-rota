@@ -1,41 +1,53 @@
-# Rota update — 4 October 2026
+# Weekly shifts inside the shift window — 14 November 2026
 
-This package updates the existing GitHub/Render rota. It has been tested locally and has not been deployed by Codex.
+This is an interface-only update for your existing Dylan Oaks warehouse rota. It adds a read-only summary of a colleague’s saved shifts while adding or editing a shift. No server file, database, saved staff information or settings file is included in the update ZIP. There is no database migration.
 
-## Changes
+## What you will see
 
-- No shows marked in Day view also appear as a red **No show** label in Week view. Times, department colours and WH1/WH2 stay visible, with compact rows. Correct or clear attendance in Day view to update the weekly label.
-- **Clear rota** clears the displayed Monday–Sunday draft week at the selected location.
-- **Clear day** in Day view clears the selected date’s draft shifts.
-- Both clear actions show the date, location and number of shifts before confirmation. They include both warehouses and all departments, including shifts hidden by filters. Work, training, holiday, sick and unavailable entries are all included. Overnight shifts are selected by their start date.
-- Colleagues, patterns, saved attendance and required hours remain saved. Other weeks and locations are preserved. Shared views and PDFs keep the earlier published copy until you publish the changes.
-- Budget hours have been removed. **Set required hours** is the only daily target; compare it with scheduled hours after unpaid breaks. An empty field removes the requirement; zero is a real requirement. Existing required hours remain saved.
-- Existing shift dragging, the simpler editor, full-width day layout, private Sick entries and weekly performance profiles are retained.
+Open an empty cell or an existing shift. **Shifts this week** shows:
 
-Attendance and required hours stay private to managers. No-show marks record actual attendance without changing planned shifts or planned hours. If a shift is moved or cleared after marking attendance, its record stays attached to the original colleague/date.
+- All seven days of the week containing the date in the shift window.
+- Each saved shift’s times, department, WH1/WH2, labels and training/absence type.
+- Split shifts, next-day finishes, and assignments at other locations.
+- Saved weekly hours after unpaid breaks, with no-show hours excluded as in the main rota.
+- An **Editing** marker on the existing shift when editing it.
 
-## Upload everything in one commit
+The summary updates when you choose another colleague or date. It includes all their assignments, even when the main rota is filtered. Scroll within the summary to see later days. You can collapse it by clicking its heading. On a wide screen it sits alongside the form; on a phone or tablet it appears above the shift fields.
 
-1. Extract **rota-week-controls-update.zip**.
-2. Open **DoWarehouse/warehouse-rota** on GitHub, branch **main**, and enter the original **warehouse-rota** folder.
-3. Select **Add file → Upload files**.
-4. Drag the three items **inside** the extracted folder into the upload area together: **server.mjs**, **public**, **lib**. Do not upload the ZIP or its outer folder.
-5. The upload must replace these five files inside the original GitHub project folder:
+The summary contains saved shifts only. A shift you are adding, or edits you have not saved, appear after you save them. Changing the summary does not reset your unsaved times, label or note. **Refresh summary** reads the latest saved week without saving the form. A failed read can be retried.
 
-| Package path | GitHub path |
-| --- | --- |
-| server.mjs | warehouse-rota/server.mjs |
-| public/index.html | warehouse-rota/public/index.html |
-| public/app.js | warehouse-rota/public/app.js |
-| public/styles.css | warehouse-rota/public/styles.css |
-| lib/dashboard.mjs | warehouse-rota/lib/dashboard.mjs |
+For bulk assignment, select one colleague to see their weekly summary. With several colleagues selected, the panel asks you to select one for the individual reference; this does not change the existing bulk-assignment behaviour.
 
-6. Commit all five replacements together to **main**.
-7. If Render Auto-Deploy is **On Commit**, wait for that deployment to become **Live**. If it is **Off**, select **Manual Deploy → Deploy latest commit** in **dylan-oaks-warehouse-rota**. A restart alone does not load a new commit.
-8. Refresh the rota. The toolbar should have **Clear rota**; Day view should have **Clear day** and **Set required hours**, with two hours cards and no Budget card.
+## Preserve your existing information
 
-Keep the existing persistent disk, DATA_DIR, manager password, dashboard connection and integration key. Root Directory stays warehouse-rota, Build Command stays npm ci and Start Command stays npm start. No dashboard service files or dependencies need changing.
+The update ZIP contains only these three application files, plus these instructions:
 
-The update uses the existing schema 4 database. Deploying the files preserves saved colleagues, shifts, attendance, requirements, publications and QR links. Clearing shifts happens only when a manager confirms a clear action.
+```text
+warehouse-rota/public/app.js
+warehouse-rota/public/styles.css
+warehouse-rota/public/index.html
+```
 
-Build marker: **rota-week-controls-20261004**. The complete package includes 55 automated tests and the browser review script.
+Your existing server, database, colleague profiles, availability, shifts, holiday balances, attendance, required hours, templates, dashboard connection, publications and QR links remain in place. No new demo data is installed. The normal existing Save, Remove shift, Delete colleague and Clear controls retain their existing behaviour; this summary does not call them automatically.
+
+Before deployment, use **Settings → Download data backup** to keep your own current backup. Keep the existing Render persistent disk, DATA_DIR, environment variables and Root Directory **warehouse-rota/**.
+
+## Upload this update
+
+1. Extract **rota-shift-week-update.zip**.
+2. Open the Code home page of **DoWarehouse/warehouse-rota**, branch **main**.
+3. Choose **Add file → Upload files** and drag the inner **warehouse-rota** folder from the extracted ZIP into the upload area.
+4. Confirm that the three application paths match the list above. Commit the three replacements together. Do not delete or reset any existing folder or file.
+5. In Render’s **dylan-oaks-warehouse-rota** service, select **Manual Deploy → Deploy latest commit** and wait for **Live**. Auto-Deploy was off when this update was prepared.
+6. Reload the rota, open an empty shift cell and look for **Shifts this week**. The page’s interface marker is **rota-shift-week-preview-20261114**. The server build value in Settings remains the existing one because the server is unchanged.
+
+This package updates the screens; it does not deploy itself. The underlying server and schema files are byte-identical to the current saved version, whose three original interface files were confirmed to match the live service before editing.
+
+## Verification
+
+- All 87 existing automated tests passed.
+- Five browser reviews passed: the four previous availability/daily-tools/no-show/manager-tools reviews and a new weekly-summary review.
+- The new review compares every row in every database table before and after opening, changing and cancelling the summary, including attendance, leave, publications, sessions, settings, QR tokens and historical shifts. Every saved row is unchanged.
+- Saving a new shift adds exactly that shift and increments the existing revision; every prior row is retained.
+- Desktop, tablet, 390px and 320px phone layouts were checked, along with week/colleague changes, stale responses, failed-read retry, unsaved input preservation, labels, overnight shifts and cross-location hours.
+- No live staff data was used or changed during testing. Browser screenshots are internal review material and are not included as new deliverables.

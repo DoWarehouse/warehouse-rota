@@ -230,3 +230,31 @@ dialog{border:1px solid var(--line);border-radius:14px;padding:0;width:580px;max
 .holiday-opening{border-top:1px solid var(--line);padding-top:12px;margin:4px 0 14px}.holiday-opening[open] summary{margin-bottom:14px}
 @media(max-width:720px){.day-dashboard{grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;padding:10px 10px 4px}.day-status{padding:8px 6px}.day-status span{font-size:.625rem}.day-status strong{font-size:1.1rem}.day-dashboard-help,.day-section-help{padding:5px 10px 9px;font-size:.625rem}.day-department-heading{padding:8px 10px;gap:5px 8px}.warehouse-day-count{margin-left:0;flex-basis:100%}.day-view .arrival-record{width:auto;text-align:left}.holiday-totals{grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.profile-holiday{padding:12px}.holiday-booking-list>div{grid-template-columns:minmax(0,1fr) auto}.holiday-booking-list span{grid-column:1}.holiday-booking-list small{grid-column:1}.holiday-booking-list .text-button{grid-column:2;grid-row:1/4}.holiday-opening input{min-width:0}}
 @media print{.day-dashboard,.day-dashboard-help,.day-section-help,.profile-holiday{display:none!important}.day-department-heading{break-after:avoid}.day-person{break-inside:avoid}}
+
+/* A read-only weekly reference beside the single-shift editor. */
+dialog.shift-context-dialog{width:1000px}
+.shift-context-layout{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:20px;align-items:start}
+.shift-context-fields,.shift-context-aside{min-width:0}
+.shift-week-summary{border:1px solid var(--line);border-radius:9px;background:#f8faff;padding:12px;margin-bottom:14px;min-width:0;font-size:.8125rem}
+.shift-week-summary>h3{font-size:.875rem;margin:0 0 8px}.shift-week-summary>.field-help{font-size:.75rem!important;margin:0}
+.shift-week-details>summary{display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer;list-style:none}
+.shift-week-details>summary::-webkit-details-marker{display:none}.shift-week-details>summary>span{min-width:0}
+.shift-week-details>summary>span>strong{display:block;font-size:.875rem}.shift-week-details>summary>span>strong::before{content:'▸';margin-right:6px;color:var(--muted)}
+.shift-week-details[open]>summary>span>strong::before{content:'▾'}
+.shift-week-details summary small{display:block;margin-top:4px;font-size:.6875rem;line-height:1.4;font-weight:400;color:var(--muted);overflow-wrap:anywhere}
+.shift-week-total{flex-shrink:0;text-align:right;font-size:1.05rem;white-space:nowrap}
+.shift-week-days{list-style:none;padding:0;margin:12px 0 0;max-height:320px;overflow:auto;scrollbar-gutter:stable}
+.shift-week-day{display:grid;grid-template-columns:43px minmax(0,1fr);gap:8px;padding:7px 0;border-top:1px solid #e0e6f1;min-width:0}
+.shift-week-day.selected-day{background:#eaf0ff;border-radius:5px}
+.shift-week-date{display:flex;align-items:baseline;gap:4px}.shift-week-date strong,.shift-week-date>span{display:block;font-size:.6875rem;line-height:1.6}.shift-week-date>span{color:var(--muted)}
+.shift-week-entries{display:flex;flex-direction:column;gap:5px;min-width:0}
+.shift-week-entry{display:flex;align-items:baseline;flex-wrap:wrap;gap:0 7px;padding:3px 0 3px 8px;border-left:3px solid #8590a3;min-width:0;overflow-wrap:anywhere}
+.shift-week-entry.blue{border-color:#517fe4}.shift-week-entry.violet{border-color:#9571d7}.shift-week-entry.teal{border-color:#359b84}.shift-week-entry.holiday{border-color:#cba44d}.shift-week-entry.sick{border-color:#bd8256}
+.shift-week-entry-title{display:flex;align-items:baseline;flex-wrap:wrap;gap:3px 7px;min-width:0;font-size:.6875rem;line-height:1.5}
+.shift-week-entry-title strong{font-size:.75rem}.shift-week-editing{color:var(--blue);font-weight:650}.shift-week-no-show{color:#9a3041;font-weight:650}
+.shift-week-assignment,.shift-week-label{display:block;font-size:.6875rem;line-height:1.5;color:var(--muted)}.shift-week-label{color:var(--ink)}
+.shift-week-off{font-size:.6875rem;color:var(--muted);padding-top:3px}
+.shift-week-footnote{display:inline-block;max-width:calc(100% - 90px);vertical-align:top;font-size:.6875rem!important;line-height:1.5;color:var(--muted);margin:10px 8px 0 0}
+.shift-week-summary .text-button{font-size:.6875rem;padding:4px 0;vertical-align:top;margin-top:8px;white-space:nowrap}
+@media(max-width:900px){dialog.shift-context-dialog{width:580px}.shift-context-layout{grid-template-columns:minmax(0,1fr);gap:0}.shift-context-aside{grid-row:1}.shift-week-summary{padding:10px}.shift-week-days{max-height:270px;overflow:auto;scrollbar-gutter:stable}.shift-week-day{padding-block:6px}}
+@media print{.shift-week-summary{display:none!important}}

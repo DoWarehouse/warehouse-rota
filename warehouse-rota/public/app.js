@@ -484,6 +484,63 @@ function wireShiftFields() {
   };
   update();
 }
+function wireShiftWeekSummary({ single, shift }) {
+  const form = $('dialog-form'), panel = $('shift-week-summary');
+  const weeks = new Map([[S.data.week, Promise.resolve(S.data)]]);
+  let sequence = 0, expanded = single;
+  const current = request => request === sequence && form.isConnected && $('modal').open;
+  const status = (message, error = false) => {
+    panel.setAttribute('aria-busy', 'false');
+    panel.innerHTML = `<h3>Shifts this week</h3><p class="field-help ${error ? 'form-error' : ''}">${h(message)}</p>${error ? '<button type="button" class="text-button" data-week-preview-refresh>Try again</button>' : ''}`;
+  };
+  const refresh = async (force = false) => {
+    const request = ++sequence;
+    const selected = single ? [$('shift-person').value] : [...form.querySelectorAll('[name="person_ids"]:checked')].map(input => input.value);
+    if (selected.length !== 1) { status('Select one colleague to see their saved shifts this week.'); return; }
+    const personId = selected[0], p = S.data.people.find(person => person.id === personId);
+    const date = single ? $('shift-date').value : form.querySelector('[name="dates"]:checked')?.value || S.week;
+    const parsed = new Date(`${date}T12:00:00Z`);
+    if (!p || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date || date < '2020-01-01' || date > '2100-12-31') {
+      status('Choose a valid date to see that week’s saved shifts.'); return;
+    }
+    const week = monday(date);
+    if (force) weeks.delete(week);
+    if (!weeks.has(week)) {
+      const reading = api(`/api/state?week=${encodeURIComponent(date)}`);
+      weeks.set(week, reading);
+      reading.catch(() => { if (weeks.get(week) === reading) weeks.delete(week); });
+    }
+    panel.setAttribute('aria-busy', 'true');
+    panel.innerHTML = '<h3>Shifts this week</h3><p class="field-help">Reading saved shifts…</p>';
+    try {
+      const data = await weeks.get(week);
+      if (!current(request)) return;
+      if (data.week !== week) throw new Error('A different week was returned. Try refreshing the summary.');
+      const entries = data.shifts.filter(entry => entry.person_id === personId && entry.date >= week && entry.date <= plusDays(week, 6))
+        .sort((a, b) => a.date.localeCompare(b.date) || (a.start_time || '').localeCompare(b.start_time || '') || a.id.localeCompare(b.id));
+      const noShow = entry => ['work', 'training'].includes(entry.kind) && (data.attendance || []).some(record => record.person_id === personId && record.location_id === entry.location_id && record.date === entry.date && record.status === 'no_show');
+      const total = entries.reduce((sum, entry) => sum + (noShow(entry) ? 0 : minutes(entry)), 0);
+      const daysHTML = days.map((name, index) => {
+        const day = plusDays(week, index), assignments = entries.filter(entry => entry.date === day);
+        return `<li class="shift-week-day ${day === date ? 'selected-day' : ''}" data-week-preview-date="${day}"><div class="shift-week-date"><strong>${name}</strong><span>${shortDate(day, { month: undefined })}</span></div><div class="shift-week-entries">${assignments.map(entry => {
+          const working = ['work', 'training'].includes(entry.kind), site = (data.locations || S.data.locations).find(location => location.id === entry.location_id);
+          const assignment = [entry.department, entry.warehouse === 'Warehouse 1' ? 'WH1' : entry.warehouse === 'Warehouse 2' ? 'WH2' : entry.warehouse, entry.location_id !== S.locationId ? site?.name || 'Other location' : ''].filter(Boolean).join(' · ');
+          const label = shiftLabel(entry), absent = noShow(entry);
+          return `<div class="shift-week-entry ${working ? departmentColour[entry.department] || 'blue' : h(entry.kind)} ${entry.id === shift?.id ? 'editing-shift' : ''}" data-week-preview-shift="${h(entry.id)}"><div class="shift-week-entry-title"><strong>${working ? `${h(entry.start_time)}–${h(entry.end_time)}${entry.end_time < entry.start_time ? ' +1' : ''}` : h(kindNames[entry.kind] || entry.kind)}</strong>${entry.kind === 'training' ? '<span>Training</span>' : ''}${entry.id === shift?.id ? '<span class="shift-week-editing">Editing</span>' : ''}${absent ? '<span class="shift-week-no-show">No show</span>' : ''}</div>${assignment ? `<span class="shift-week-assignment">${h(assignment)}</span>` : ''}${label ? `<span class="shift-week-label">${h(label)}</span>` : ''}</div>`;
+        }).join('') || '<span class="shift-week-off">No shift</span>'}</div></li>`;
+      }).join('');
+      panel.setAttribute('aria-busy', 'false');
+      panel.innerHTML = `<details class="shift-week-details" ${expanded ? 'open' : ''}><summary><span><strong>Shifts this week</strong><small>${h(p.name)} · ${shortDate(week)}–${shortDate(plusDays(week, 6), { year: 'numeric' })}</small></span><strong class="shift-week-total">${hours(total)}h<small>saved</small></strong></summary><ol class="shift-week-days">${daysHTML}</ol><p class="shift-week-footnote">All locations · After breaks${entries.some(noShow) ? ' · No shows excluded' : ''}. Unsaved changes are not included.</p><button type="button" class="text-button" data-week-preview-refresh>Refresh summary</button></details>`;
+      panel.querySelector('details').ontoggle = event => { expanded = event.currentTarget.open; };
+    } catch (error) { if (current(request)) status(`Could not read this week’s shifts. ${error.message} Your shift details are unchanged.`, true); }
+  };
+  const changed = event => {
+    if (['shift-person', 'shift-date', 'bulk-all'].includes(event.target.id) || ['person_ids', 'dates'].includes(event.target.name)) refresh();
+  };
+  form.addEventListener('input', changed); form.addEventListener('change', changed);
+  panel.onclick = event => { if (event.target.closest('[data-week-preview-refresh]')) refresh(true); };
+  refresh();
+}
 function openAssign({ personIds = [...S.selected], dates = [], shift = null } = {}) {
   if (readOnly) return;
   const single = Boolean(shift) || (personIds.length === 1 && dates.length === 1);
@@ -493,8 +550,11 @@ function openAssign({ personIds = [...S.selected], dates = [], shift = null } = 
   const body = single ? `<div class="field-row"><label>Colleague<select id="shift-person">${people.map(p => `<option value="${h(p.id)}" ${personIds.includes(p.id) ? 'selected' : ''}>${h(p.name)}</option>`).join('')}</select></label><label>Date<input type="date" id="shift-date" value="${dates[0]}" required min="2020-01-01" max="2100-12-31"></label></div>` : `<div class="assign-layout"><section><div class="section-label"><strong>Colleagues</strong><label class="check-label"><input id="bulk-all" type="checkbox">Select all</label></div><input id="bulk-search" type="search" placeholder="Find a colleague…" aria-label="Find colleagues to assign"><div class="people-checklist">${people.map(p => `<label class="person-check" data-name="${h(p.name.toLocaleLowerCase())}"><input type="checkbox" name="person_ids" value="${h(p.id)}" ${personIds.includes(p.id) ? 'checked' : ''}><span><strong>${h(p.name)}</strong><small>${h(departmentName(p))}</small></span></label>`).join('')}</div><p class="field-help" id="bulk-count"></p></section><section><strong class="section-label">Days this week</strong><div class="days-checklist">${days.map((d, i) => { const date = plusDays(S.week, i); return `<label class="check-label"><input type="checkbox" name="dates" value="${date}" ${dates.length ? dates.includes(date) ? 'checked' : '' : i < 5 ? 'checked' : ''}><span>${d}</span><small>${shortDate(date)}</small></label>`; }).join('')}</div></section></div>`;
   const department = shift?.department ?? (single ? defaultDepartment(people.find(p => p.id === personIds[0])) : '');
   const assignmentFields = `<div id="assignment-fields"><div class="field-row"><label>Department<select id="shift-department"><option value="">${single ? 'Choose department' : 'Use each colleague’s default'}</option>${choices(departments, department)}</select></label><label>Warehouse<select id="shift-warehouse"><option value="">Choose warehouse</option>${choices(warehouses, shift?.warehouse ?? (S.warehouse || (single ? people.find(p => p.id === personIds[0])?.default_warehouse : '')))}</select></label></div></div>`;
-  modal(shift ? 'Edit shift' : single ? 'Add shift' : 'Assign shifts', `${body}${fieldsHTML(shift || {}, assignmentFields)}<div id="shift-availability-warning" class="availability-warning" role="status" aria-live="polite" hidden></div>`, `${shift ? '<button type="button" class="button danger" id="remove-shift">Remove shift</button><span class="footer-spacer"></span>' : ''}${cancel}<button class="button primary" type="submit">${shift ? 'Save changes' : 'Assign shifts'}</button>`, !single);
+  const weekPanel = '<section id="shift-week-summary" class="shift-week-summary" aria-label="Colleague’s saved shifts for the selected week" aria-live="polite"></section>';
+  const fields = `${fieldsHTML(shift || {}, assignmentFields)}<div id="shift-availability-warning" class="availability-warning" role="status" aria-live="polite" hidden></div>`;
+  modal(shift ? 'Edit shift' : single ? 'Add shift' : 'Assign shifts', `${body}${single ? `<div class="shift-context-layout"><div class="shift-context-fields">${fields}</div><aside class="shift-context-aside">${weekPanel}</aside></div>` : `${weekPanel}${fields}`}`, `${shift ? '<button type="button" class="button danger" id="remove-shift">Remove shift</button><span class="footer-spacer"></span>' : ''}${cancel}<button class="button primary" type="submit">${shift ? 'Save changes' : 'Assign shifts'}</button>`, !single);
   $('modal').classList.add('shift-dialog');
+  if (single) $('modal').classList.add('shift-context-dialog');
   wireShiftFields();
   if (single) $('shift-person').onchange = event => { const person = people.find(p => p.id === event.target.value); $('shift-department').value = defaultDepartment(person); if (person.default_warehouse) $('shift-warehouse').value = person.default_warehouse; };
   if (!single) {
@@ -533,6 +593,7 @@ function openAssign({ personIds = [...S.selected], dates = [], shift = null } = 
   if ($('remove-shift')) $('remove-shift').onclick = () => {
     if (confirm('Remove this shift from the draft rota?')) formAction($('dialog-form'), async () => { await mutate(`/api/shifts/${shift.id}`, {}, 'DELETE'); closeDialog(); toast('Shift removed from the draft rota.'); });
   };
+  wireShiftWeekSummary({ single, shift });
 }
 function openTeam() {
   const people = S.data.people.filter(p => p.location_id === S.locationId);
