@@ -1,6 +1,7 @@
 import PDFDocument from 'pdfkit';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { packingPositionLabel } from '../public/packing.js';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const palette = { Picking: ['#3157ca', '#edf2ff'], Engraving: ['#8055ad', '#f1edfb'], Packing: ['#247d70', '#e7f5f4'] };
 const abbreviations = { Picking: 'PICK', Engraving: 'ENG', Packing: 'PACK' };
@@ -46,7 +47,8 @@ export function rotaPDF(snapshot, { layout = 'warehouse', warehouse = '', depart
     if (!['work', 'training'].includes(s.kind)) return [kindName, label].filter(Boolean).join('\n');
     const time = `${s.start_time}-${s.end_time}${s.end_time < s.start_time ? ' +1' : ''}`;
     const assignment = compact ? `${s.warehouse === 'Warehouse 2' ? 'WH2' : s.warehouse === 'Warehouse 1' ? 'WH1' : '?'} | ${abbreviations[s.department] || '?'}` : `${s.department || 'Department unset'}\n${s.warehouse || 'Warehouse unset'}`;
-    return [time, s.kind === 'training' ? 'Training' : '', label, assignment, compact ? (s.break_start ? breakLabel(s) : s.break_minutes ? `Break ${s.break_minutes}m - unset` : '') : breakLabel(s)].filter(Boolean).join('\n');
+    const position = packingPositionLabel(s, snapshot.packingStations);
+    return [time, s.kind === 'training' ? 'Training' : '', label, position ? `${assignment} | ${position}` : assignment, compact ? (s.break_start ? breakLabel(s) : s.break_minutes ? `Break ${s.break_minutes}m - unset` : '') : breakLabel(s)].filter(Boolean).join('\n');
   }
   function row(person, entries, group) {
     const columns = Array.from({ length: 7 }, (_, i) => entries.filter(s => s.date === plusDays(snapshot.week, i)));

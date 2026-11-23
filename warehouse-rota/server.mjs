@@ -10,6 +10,7 @@ import { createDashboardReader } from './lib/dashboard.mjs';
 import { normalizeAvailability, availabilityWarning, isShiftAvailable } from './public/availability.js';
 import { arrivalDetails } from './public/manager-tools.js';
 import { holidayBalance } from './lib/holiday.mjs';
+import { isPackingShift, packingPositionLabel, packingIntervalsOverlap } from './public/packing.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -153,7 +154,7 @@ export function createRotaServer(options = {}) {
     CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, password_fingerprint TEXT NOT NULL);
   `);
   const schemaVersion = Number(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get().value);
-  requireThat(schemaVersion <= 6, 'This database needs a newer version of the rota app.', 500);
+  requireThat(schemaVersion <= 7, 'This database needs a newer version of the rota app.', 500);
   if (schemaVersion < 2) {
     // Keep the original assignments and QR tokens. Old warehouse assignments
     // stay unset until a manager chooses them; never guess where someone works.
@@ -250,6 +251,29 @@ export function createRotaServer(options = {}) {
       UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
       COMMIT;`);
   }
+  if (schemaVersion < 7) {
+    // Back up the complete populated database before this additive migration.
+    // Existing shifts, publications, attendance and colleague records stay intact.
+    if (db.prepare('SELECT COUNT(*) AS n FROM people').get().n > 0) {
+      const dir = path.join(dataDir, 'backups'); fs.mkdirSync(dir, { recursive: true });
+      const destination = path.join(dir, 'rota-before-schema-7.sqlite');
+      if (!fs.existsSync(destination)) db.prepare('VACUUM INTO ?').run(destination);
+    }
+    db.exec(`BEGIN IMMEDIATE;
+      CREATE TABLE packing_stations (
+        id TEXT PRIMARY KEY, location_id TEXT NOT NULL REFERENCES locations(id),
+        warehouse TEXT NOT NULL CHECK(warehouse IN ('Warehouse 1','Warehouse 2')),
+        number INTEGER NOT NULL CHECK(number BETWEEN 1 AND 99),
+        active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+        UNIQUE(location_id, warehouse, number)
+      );
+      ALTER TABLE shifts ADD COLUMN packing_station_id TEXT REFERENCES packing_stations(id);
+      ALTER TABLE shifts ADD COLUMN packing_position TEXT NOT NULL DEFAULT '' CHECK(packing_position IN ('','A','B'));
+      CREATE INDEX idx_shifts_packing ON shifts(packing_station_id, packing_position, date);
+      UPDATE meta SET value = '7' WHERE key = 'schema_version';
+      UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'revision';
+      COMMIT;`);
+  }
   if (!db.prepare('SELECT id FROM locations LIMIT 1').get()) {
     db.prepare('INSERT INTO locations (id, name, share_token) VALUES (?, ?, ?)').run(uuid(), 'Warehouse', token());
   }
@@ -283,6 +307,12 @@ export function createRotaServer(options = {}) {
     requireThat(row, 'Colleague not found.', 404);
     return personRecord(row);
   };
+  const packingStations = () => db.prepare('SELECT * FROM packing_stations ORDER BY location_id, warehouse, number, id').all();
+  function sharedShift({ note, holiday_minutes, holiday_approved, packing_station_id, packing_position, ...shift }) {
+    // Omit empty new fields so upgrading alone does not dirty existing publications.
+    if (isPackingShift(shift) && packing_station_id && packing_position) Object.assign(shift, { packing_station_id, packing_position });
+    return shift.kind === 'sick' ? { ...shift, kind: 'unavailable', label: 'Unavailable' } : shift;
+  }
   function snapshot(locationId, week) {
     const loc = location(locationId);
     const shifts = db.prepare('SELECT * FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ? ORDER BY date, person_id, start_time, id').all(locationId, week, addDays(week, 6));
@@ -290,11 +320,17 @@ export function createRotaServer(options = {}) {
     const people = db.prepare('SELECT * FROM people ORDER BY team COLLATE NOCASE, row_order, name COLLATE NOCASE, id').all()
       .filter(p => (p.active && p.location_id === locationId) || ids.has(p.id))
       .map(({ id, name, team, default_department, role, row_order, is_example }) => ({ id, name, team, default_department, role, row_order, is_example }));
+    const carryover = db.prepare("SELECT s.*, p.name AS person_name FROM shifts s JOIN people p ON p.id = s.person_id WHERE s.location_id = ? AND s.date = ? AND s.packing_station_id IS NOT NULL AND s.end_time < s.start_time").all(locationId, addDays(week, -1)).map(sharedShift);
+    const assigned = [...shifts, ...carryover].filter(s => isPackingShift(s) && s.packing_station_id);
+    const stationData = assigned.length ? {
+      packingStations: packingStations().filter(s => s.location_id === locationId && (s.active || assigned.some(shift => shift.packing_station_id === s.id))).map(({ id, location_id, warehouse, number }) => ({ id, location_id, warehouse, number })),
+      ...(carryover.length ? { packingCarryover: carryover } : {})
+    } : {};
     return {
       location: { id: loc.id, name: loc.name }, week, people,
       departments: DEPARTMENTS, warehouses: WAREHOUSES,
       // Absence reasons and daily manager records do not go on the shared rota.
-      shifts: shifts.map(({ note, holiday_minutes, holiday_approved, ...shift }) => shift.kind === 'sick' ? { ...shift, kind: 'unavailable', label: 'Unavailable' } : shift)
+      shifts: shifts.map(sharedShift), ...stationData
     };
   }
   function state(week) {
@@ -303,7 +339,8 @@ export function createRotaServer(options = {}) {
       dirty: hash(JSON.stringify(snapshot(p.location_id, week))) !== hash(p.snapshot)
     }));
     return {
-      revision: revision(), week, demo, build: 'rota-manager-tools-20261009', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      revision: revision(), week, demo, build: 'rota-packing-stations-20261123', departments: DEPARTMENTS, warehouses: WAREHOUSES,
+      packingStations: packingStations(),
       previousShifts: db.prepare('SELECT * FROM shifts WHERE date = ?').all(addDays(week, -1)),
       previousAttendance: db.prepare('SELECT * FROM attendance WHERE date = ? ORDER BY person_id').all(addDays(week, -1)),
       dashboard: { url: dashboardSetting('dashboard_url'), hasKey: Boolean(dashboardSetting('dashboard_api_key')) },
@@ -316,12 +353,29 @@ export function createRotaServer(options = {}) {
       publications
     };
   }
+  function validatePackingPosition(shift, previous = null, additional = []) {
+    const id = shift.packing_station_id;
+    requireThat(id === null || typeof id === 'string', 'Choose a valid packing station.');
+    if (!id) {
+      requireThat(!shift.packing_position, 'Choose a station for the A/B position.');
+      shift.packing_station_id = null; shift.packing_position = ''; return;
+    }
+    requireThat(isPackingShift(shift), 'Packing positions can only be assigned to Packing work or training shifts.');
+    requireThat(['A', 'B'].includes(shift.packing_position), 'Choose position A or B.');
+    const station = db.prepare('SELECT * FROM packing_stations WHERE id = ?').get(id);
+    requireThat(station && station.location_id === shift.location_id && station.warehouse === shift.warehouse, 'Choose a packing station in this shift’s warehouse and location.');
+    const unchanged = previous && previous.packing_station_id === id && previous.packing_position === shift.packing_position && previous.date === shift.date;
+    requireThat(station.active || unchanged, 'This packing station is archived. Choose an active station.');
+    const neighbours = db.prepare('SELECT * FROM shifts WHERE packing_station_id = ? AND packing_position = ? AND date BETWEEN ? AND ?').all(id, shift.packing_position, addDays(shift.date, -1), addDays(shift.date, 1));
+    const conflict = [...neighbours, ...additional].find(other => other.id !== shift.id && other.packing_station_id === id && other.packing_position === shift.packing_position && packingIntervalsOverlap(other, shift));
+    requireThat(!conflict, `${station.number}${shift.packing_position} in ${station.warehouse} is occupied during this shift. Choose another position or review the times.`, 422);
+  }
   function validateShift(body, skipId, additional = [], allowUnassigned = false) {
     const p = person(body.person_id), loc = location(body.location_id);
     requireThat(p.active && loc.active, 'Reactivate this colleague or location before assigning shifts.');
     const shift = { id: skipId || uuid(), person_id: p.id, location_id: loc.id, date: dateValue(body.date), ...shiftFields(body) };
     const working = ['work', 'training'].includes(shift.kind);
-    const previous = skipId ? db.prepare('SELECT holiday_minutes, holiday_approved, kind FROM shifts WHERE id = ?').get(skipId) : null;
+    const previous = skipId ? db.prepare('SELECT * FROM shifts WHERE id = ?').get(skipId) : null;
     const holidayHours = body.holiday_hours === undefined ? undefined : body.holiday_hours;
     shift.holiday_minutes = null;
     if (shift.kind === 'holiday') {
@@ -340,13 +394,16 @@ export function createRotaServer(options = {}) {
     shift.colour = ({ Picking: 'blue', Engraving: 'violet', Packing: 'teal' })[shift.department] || shift.colour;
     requireThat(DEPARTMENTS.includes(shift.department) || (shift.department === '' && (!working || allowUnassigned)), `${p.name}: choose Picking, Engraving or Packing for this shift, or set a default department.`);
     requireThat(WAREHOUSES.includes(shift.warehouse) || (shift.warehouse === '' && (!working || allowUnassigned)), 'Choose Warehouse 1 or Warehouse 2 for this shift.');
+    shift.packing_station_id = body.packing_station_id === undefined ? previous?.packing_station_id ?? null : body.packing_station_id;
+    shift.packing_position = body.packing_position === undefined ? shift.packing_station_id ? previous?.packing_position ?? '' : '' : body.packing_position;
+    validatePackingPosition(shift, previous, additional);
     const existing = db.prepare('SELECT * FROM shifts WHERE person_id = ? AND date BETWEEN ? AND ?').all(p.id, addDays(shift.date, -1), addDays(shift.date, 1));
     const conflict = [...existing, ...additional].find(s => s.id !== skipId && overlaps(s, shift));
     requireThat(!conflict, `${p.name} already has an overlapping shift or absence on ${conflict?.date || shift.date}.`, 422);
     return shift;
   }
-  const insertShift = db.prepare('INSERT INTO shifts (id, person_id, location_id, date, start_time, end_time, break_minutes, kind, label, colour, note, department, warehouse, break_start, holiday_minutes, holiday_approved) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-  const shiftArgs = s => [s.id, s.person_id, s.location_id, s.date, s.start_time, s.end_time, s.break_minutes, s.kind, s.label, s.colour, s.note, s.department, s.warehouse, s.break_start, s.holiday_minutes ?? null, s.holiday_approved ?? 1];
+  const insertShift = db.prepare('INSERT INTO shifts (id, person_id, location_id, date, start_time, end_time, break_minutes, kind, label, colour, note, department, warehouse, break_start, holiday_minutes, holiday_approved, packing_station_id, packing_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const shiftArgs = s => [s.id, s.person_id, s.location_id, s.date, s.start_time, s.end_time, s.break_minutes, s.kind, s.label, s.colour, s.note, s.department, s.warehouse, s.break_start, s.holiday_minutes ?? null, s.holiday_approved ?? 1, s.packing_station_id ?? null, s.packing_position || ''];
   function checkAvailability(shifts, body) {
     if (body.override_availability === true) return;
     const warnings = shifts.map(shift => ({ person_id: shift.person_id, date: shift.date, message: availabilityWarning(person(shift.person_id), shift) })).filter(w => w.message);
@@ -444,7 +501,7 @@ export function createRotaServer(options = {}) {
       const p = person(entry.person_id), skip = reason => skipped.push({ person_id: p.id, name: p.name, reason });
       if (!p.active) { skip('Colleague is archived'); continue; }
       let shift;
-      try { shift = validateShift({ ...entry, date: target }, undefined, shifts, true); }
+      try { shift = validateShift({ ...entry, date: target, packing_station_id: null, packing_position: '' }, undefined, shifts, true); }
       catch (error) { if (error instanceof Problem && error.status === 422) { skip(error.message); continue; } throw error; }
       const warning = availabilityWarning(p, shift);
       if (warning) {
@@ -668,8 +725,8 @@ export function createRotaServer(options = {}) {
           const snap = snapshot(loc.id, week);
           const draftShifts = db.prepare('SELECT * FROM shifts WHERE location_id = ? AND date BETWEEN ? AND ? ORDER BY date, person_id, start_time, id').all(loc.id, week, addDays(week, 6));
           const names = new Map(snap.people.map(p => [p.id, p]));
-          const rows = [['Name', 'Default department', 'Department', 'Warehouse', 'Date', 'Shift', 'Start', 'Finish', 'Break starts', 'Unpaid break minutes', 'Scheduled hours', 'Type']];
-          for (const s of draftShifts) rows.push([names.get(s.person_id).name, names.get(s.person_id).default_department, s.department, s.warehouse, s.date, s.label, s.start_time || '', s.end_time || '', s.break_start || '', s.break_minutes, (scheduledMinutes(s) / 60).toFixed(2), s.kind]);
+          const rows = [['Name', 'Default department', 'Department', 'Warehouse', 'Date', 'Shift', 'Start', 'Finish', 'Break starts', 'Unpaid break minutes', 'Scheduled hours', 'Type', 'Packing position']];
+          for (const s of draftShifts) rows.push([names.get(s.person_id).name, names.get(s.person_id).default_department, s.department, s.warehouse, s.date, s.label, s.start_time || '', s.end_time || '', s.break_start || '', s.break_minutes, (scheduledMinutes(s) / 60).toFixed(2), s.kind, packingPositionLabel(s, packingStations())]);
           res.setHeader('Content-Disposition', `attachment; filename="rota-${week}.csv"`);
           return send(res, 200, '\uFEFF' + rows.map(row => row.map(csvCell).join(',')).join('\r\n'), 'text/csv; charset=utf-8');
         }
@@ -686,6 +743,45 @@ export function createRotaServer(options = {}) {
         csrf(req);
         const body = await readBody(req);
         const result = mutation(req, () => {
+          if (method === 'POST' && pathname === '/api/packing-stations') {
+            const loc = location(body.location_id);
+            requireThat(loc.active, 'Reactivate this location before adding stations.');
+            requireThat(WAREHOUSES.includes(body.warehouse), 'Choose Warehouse 1 or Warehouse 2.');
+            const start = integer(body.start_number, 1, 99, 'First station'), end = integer(body.end_number ?? body.start_number, start, 99, 'Last station');
+            let created = 0, restored = 0, existing = 0;
+            for (let number = start; number <= end; number++) {
+              const saved = db.prepare('SELECT * FROM packing_stations WHERE location_id = ? AND warehouse = ? AND number = ?').get(loc.id, body.warehouse, number);
+              if (!saved) { db.prepare('INSERT INTO packing_stations (id, location_id, warehouse, number) VALUES (?, ?, ?, ?)').run(uuid(), loc.id, body.warehouse, number); created++; }
+              else if (!saved.active) { db.prepare('UPDATE packing_stations SET active = 1 WHERE id = ?').run(saved.id); restored++; }
+              else existing++;
+            }
+            return { created, restored, existing };
+          }
+          if (method === 'PUT' && /^\/api\/packing-stations\/[^/]+$/.test(pathname)) {
+            const id = pathname.split('/').at(-1), station = db.prepare('SELECT * FROM packing_stations WHERE id = ?').get(id);
+            requireThat(station, 'Packing station not found.', 404);
+            requireThat([true, false, 0, 1].includes(body.active), 'Choose active or archived.');
+            const active = body.active ? 1 : 0;
+            if (!active) {
+              const date = today(), clock = new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(new Date());
+              const now = Date.parse(`${date}T00:00:00Z`) / 60000 + timeMinutes(clock);
+              const upcoming = db.prepare('SELECT * FROM shifts WHERE packing_station_id = ? AND date >= ?').all(id, addDays(date, -1)).some(shift => interval(shift)[1] > now);
+              requireThat(!upcoming, 'Unassign current and future shifts from this station before archiving it.');
+            }
+            db.prepare('UPDATE packing_stations SET active = ? WHERE id = ?').run(active, id);
+            return { id, active };
+          }
+          if (method === 'PUT' && /^\/api\/shifts\/[^/]+\/packing-position$/.test(pathname)) {
+            const id = pathname.split('/')[3], shift = db.prepare('SELECT * FROM shifts WHERE id = ?').get(id);
+            requireThat(shift, 'Shift not found.', 404);
+            requireThat(dateValue(body.date) === shift.date, 'Assign a position on the shift’s own day.');
+            requireThat(body.location_id === shift.location_id && body.warehouse === shift.warehouse, 'Choose a position in the shift’s own warehouse and location.');
+            const next = { ...shift, packing_station_id: body.packing_station_id ?? null, packing_position: body.packing_position ?? '' };
+            validatePackingPosition(next, shift);
+            // Only these two fields change: never move the person, date, times or breaks.
+            db.prepare('UPDATE shifts SET packing_station_id = ?, packing_position = ? WHERE id = ?').run(next.packing_station_id, next.packing_position, id);
+            return { id };
+          }
           if (method === 'POST' && pathname === '/api/attendance') {
             const p = person(body.person_id), loc = location(body.location_id), date = dateValue(body.date);
             requireThat(['checked_in', 'late', 'no_show', 'unmarked'].includes(body.status), 'Choose checked in, late, no show or clear attendance.');
@@ -833,7 +929,7 @@ export function createRotaServer(options = {}) {
             for (const shift of shifts) {
               if (!person(shift.person_id).active) { skipped++; continue; }
               try {
-                const next = validateShift({ ...shift, date: addDays(shift.date, 7) }, undefined, [], true);
+                const next = validateShift({ ...shift, date: addDays(shift.date, 7), packing_station_id: null, packing_position: '' }, undefined, [], true);
                 if (!isShiftAvailable(person(shift.person_id).availability, next)) { skipped++; availabilitySkipped++; continue; }
                 insertShift.run(...shiftArgs(next)); copied++;
               } catch (error) { if (error.status === 422) skipped++; else throw error; }
@@ -874,7 +970,7 @@ export function createRotaServer(options = {}) {
         return send(res, 200, result);
       }
       requireThat(method === 'GET' || method === 'HEAD', 'Method not allowed.', 405);
-      const publicFiles = { '/manager-tools.js': ['manager-tools.js', 'text/javascript; charset=utf-8'], '/availability.js': ['availability.js', 'text/javascript; charset=utf-8'], '/coverage.js': ['coverage.js', 'text/javascript; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
+      const publicFiles = { '/packing.js': ['packing.js', 'text/javascript; charset=utf-8'], '/manager-tools.js': ['manager-tools.js', 'text/javascript; charset=utf-8'], '/availability.js': ['availability.js', 'text/javascript; charset=utf-8'], '/coverage.js': ['coverage.js', 'text/javascript; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'], '/favicon.svg': ['favicon.svg', 'image/svg+xml'] };
       const file = publicFiles[pathname];
       if (file) return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', file[0])), file[1]);
       if (pathname === '/' || /^\/rota\/[A-Za-z0-9_-]{43}$/.test(pathname)) return send(res, 200, fs.readFileSync(path.join(ROOT, 'public', 'index.html')), 'text/html; charset=utf-8');

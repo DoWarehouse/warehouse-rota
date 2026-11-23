@@ -1,53 +1,52 @@
-# Weekly shifts inside the shift window — 14 November 2026
+# Packing station pairs - 23 November 2026
 
-This is an interface-only update for your existing Dylan Oaks warehouse rota. It adds a read-only summary of a colleague’s saved shifts while adding or editing a shift. No server file, database, saved staff information or settings file is included in the update ZIP. There is no database migration.
+This update adds daily Packing positions such as 1A/1B and 2A/2B, separately for Warehouse 1 and Warehouse 2. It includes the FTE summary and weekly shift reference from the previous updates.
 
-## What you will see
+## Keep the existing rota data
 
-Open an empty cell or an existing shift. **Shifts this week** shows:
+Before updating, sign in as manager and open **Settings (sliders icon) -> Download data backup**. This downloads a complete SQLite copy of the current rota.
 
-- All seven days of the week containing the date in the shift window.
-- Each saved shift’s times, department, WH1/WH2, labels and training/absence type.
-- Split shifts, next-day finishes, and assignments at other locations.
-- Saved weekly hours after unpaid breaks, with no-show hours excluded as in the main rota.
-- An **Editing** marker on the existing shift when editing it.
+Keep the same Render service, persistent disk, DATA_DIR=/var/data, environment values and GitHub folder structure. This package contains application code only: no database, demo data or reset command. Updating it does not replace any colleague, shift, attendance record, holiday balance, required hours, dashboard connection, published rota or QR token.
 
-The summary updates when you choose another colleague or date. It includes all their assignments, even when the main rota is filtered. Scroll within the summary to see later days. You can collapse it by clicking its heading. On a wide screen it sits alongside the form; on a phone or tablet it appears above the shift fields.
+The first updated start adds a packing_stations table and two optional shift fields. Existing shifts remain unassigned to stations; no assignments are guessed. Before upgrading a populated database from schema 6, the app makes **/var/data/backups/rota-before-schema-7.sqlite**. The upgrade is additive and runs once.
 
-The summary contains saved shifts only. A shift you are adding, or edits you have not saved, appear after you save them. Changing the summary does not reset your unsaved times, label or note. **Refresh summary** reads the latest saved week without saving the form. A failed read can be retried.
+## Upload the latest update
 
-For bulk assignment, select one colleague to see their weekly summary. With several colleagues selected, the panel asks you to select one for the individual reference; this does not change the existing bulk-assignment behaviour.
+Use **rota-packing-stations-update.zip** for this update. It contains these six application files under the existing warehouse-rota folder:
 
-## Preserve your existing information
+| File | Action |
+| --- | --- |
+| warehouse-rota/server.mjs | Replace |
+| warehouse-rota/lib/pdf.mjs | Replace |
+| warehouse-rota/public/app.js | Replace |
+| warehouse-rota/public/styles.css | Replace |
+| warehouse-rota/public/index.html | Replace |
+| warehouse-rota/public/packing.js | Add (new file) |
 
-The update ZIP contains only these three application files, plus these instructions:
+1. Extract the ZIP on your computer.
+2. Open **DoWarehouse/warehouse-rota** on GitHub, branch **main**, at the repository's Code home page.
+3. Select **Add file -> Upload files**, then drag in the extracted **warehouse-rota** folder. It must merge into the existing folder. Keep lib/pdf.mjs in lib and the four browser files in public. Upload all six together and commit the changes. Do not upload the ZIP itself.
+4. In your existing Render service, keep **Root Directory: warehouse-rota**, **Build: npm ci** and **Start: npm start**. Choose **Manual Deploy -> Deploy latest commit** and wait for **Live**. Automatic deploys are currently off, so committing files alone does not update the live app.
+5. Refresh the rota and check **Settings -> App version: rota-packing-stations-20261123**. All six files are needed for this version. A hard refresh may be needed on an existing browser tab.
 
-```text
-warehouse-rota/public/app.js
-warehouse-rota/public/styles.css
-warehouse-rota/public/index.html
-```
+No new packages or environment variables are needed. The dashboard needs no changes. The ZIP has not been pushed to GitHub or deployed on Render for you.
 
-Your existing server, database, colleague profiles, availability, shifts, holiday balances, attendance, required hours, templates, dashboard connection, publications and QR links remain in place. No new demo data is installed. The normal existing Save, Remove shift, Delete colleague and Clear controls retain their existing behaviour; this summary does not call them automatically.
+## Set up and use stations
 
-Before deployment, use **Settings → Download data backup** to keep your own current backup. Keep the existing Render persistent disk, DATA_DIR, environment variables and Root Directory **warehouse-rota/**.
+1. Open **Day** view and find **Packing -> Manage stations**, or use **Settings -> Packing stations**.
+2. Choose **Warehouse 1** and enter a range of station numbers, for example **1 to 4**. This creates 1A/1B, 2A/2B, 3A/3B and 4A/4B. Repeat for Warehouse 2 using its own numbers. Re-adding existing numbers keeps them; archived numbers can be restored.
+3. Drag a colleague's saved Packing shift from **Unassigned Packing shifts** into the desired A/B position. Alternatively, use **Choose shift** in a position; this also works on phones. The single-shift editor has an optional **Packing position** selector.
+4. A and B are shown together under the same station and warehouse. Their times remain visible. A warning identifies a station when its A/B shifts do not overlap. Overnight assignments show the next morning as **Until [finish time] - from [previous day]**.
+5. **Publish** the week when ready. Colleagues using the existing QR code can open Day view to see their station and partner. Weekly shift cards, the editor's weekly reference, PDFs and CSV exports show the position label too. Draft position changes remain private until publishing.
 
-## Upload this update
+Assigning a position changes only that shift's station and A/B field. It does not change the colleague, date, type, hours, breaks, labels, notes or attendance. Picking and Engraving remain separate departments. Packing stays Packing; stations are not new departments or colleague profile roles.
 
-1. Extract **rota-shift-week-update.zip**.
-2. Open the Code home page of **DoWarehouse/warehouse-rota**, branch **main**.
-3. Choose **Add file → Upload files** and drag the inner **warehouse-rota** folder from the extracted ZIP into the upload area.
-4. Confirm that the three application paths match the list above. Commit the three replacements together. Do not delete or reset any existing folder or file.
-5. In Render’s **dylan-oaks-warehouse-rota** service, select **Manual Deploy → Deploy latest commit** and wait for **Live**. Auto-Deploy was off when this update was prepared.
-6. Reload the rota, open an empty shift cell and look for **Shifts this week**. The page’s interface marker is **rota-shift-week-preview-20261114**. The server build value in Settings remains the existing one because the server is unchanged.
+An A/B position cannot contain overlapping shifts, including overnight overlaps. Different non-overlapping shifts can use the same position during the day. A no show retains its planned position until you explicitly unassign it. Warehouse and location must match the shift. A position never overwrites another person's shift.
 
-This package updates the screens; it does not deploy itself. The underlying server and schema files are byte-identical to the current saved version, whose three original interface files were confirmed to match the live service before editing.
+**Unassign position**, or drag to **Drop here to unassign a position**, removes only the station assignment and keeps the full shift. Station **Archive** retains historical assignments and is blocked while current/future assignments remain. There is no station-delete action.
+
+Copy day/week preserves the original shifts and their pairings. The newly copied shifts start with no station assignment, ready to pair for the new day. Name search filters the unassigned list; the station board keeps both partners visible. Warehouse and department filters still apply.
 
 ## Verification
 
-- All 87 existing automated tests passed.
-- Five browser reviews passed: the four previous availability/daily-tools/no-show/manager-tools reviews and a new weekly-summary review.
-- The new review compares every row in every database table before and after opening, changing and cancelling the summary, including attendance, leave, publications, sessions, settings, QR tokens and historical shifts. Every saved row is unchanged.
-- Saving a new shift adds exactly that shift and increments the existing revision; every prior row is retained.
-- Desktop, tablet, 390px and 320px phone layouts were checked, along with week/colleague changes, stale responses, failed-read retry, unsaved input preservation, labels, overnight shifts and cross-location hours.
-- No live staff data was used or changed during testing. Browser screenshots are internal review material and are not included as new deliverables.
+100 automated tests passed, including a populated schema 6 upgrade with every original database record and published snapshot checked against the pre-upgrade backup. Browser checks used 60 fictional colleagues and covered real dragging, occupancy rejection, warehouse/department validation, unassignment, mobile selection, publication privacy, CSV/PDF labels, unchanged shift details and 390px/320px layouts. Existing FTE, shift-week reference, attendance, copying, holiday and compact-row reviews also passed. Normal weekly single-shift rows remained approximately 51px high.

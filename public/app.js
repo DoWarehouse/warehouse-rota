@@ -1,5 +1,8 @@
 'use strict';
 import { coverageForDay, clockMinutes, clockLabel, shiftWindow } from './coverage.js';
+import { availabilityDays, availabilityDayText, availabilityWarning, normalizeAvailability } from './availability.js';
+import { managerDaySummary } from './manager-tools.js';
+import { isPackingShift, packingPositionLabel, packingIntervalsOverlap } from './packing.js';
 const departmentColour = { Picking: 'blue', Engraving: 'violet', Packing: 'teal' };
 const $ = id => document.getElementById(id);
 const h = value => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -73,7 +76,7 @@ async function api(url, options = {}) {
   if (!response.ok) {
     if (response.status === 409) await load();
     if (response.status === 401 && !readOnly && !url.endsWith('/api/login')) { S.authenticated = false; renderLogin(); }
-    throw new Error(result.error || 'The request could not be completed.');
+    throw Object.assign(new Error(result.error || 'The request could not be completed.'), { status: response.status, code: result.code, warnings: result.warnings });
   }
   return result;
 }
@@ -134,6 +137,16 @@ async function formAction(form, action) {
     else toast(error.message, true);
   } finally { buttons.forEach(b => b.disabled = false); }
 }
+async function saveWithAvailability(url, body, method = 'POST') {
+  try { return await mutate(url, body, method); }
+  catch (error) {
+    if (error.code !== 'availability_warning') throw error;
+    const warnings = error.warnings || [];
+    const detail = warnings.slice(0, 8).map(w => w.message).join('\n\n');
+    if (!confirm(`Outside colleague availability\n\n${detail}${warnings.length > 8 ? `\n\nPlus ${warnings.length - 8} other conflicts.` : ''}\n\nSchedule anyway?`)) return null;
+    return mutate(url, { ...body, override_availability: true }, method);
+  }
+}
 function currentLocation() { return readOnly ? S.data.location : S.data.locations.find(l => l.id === S.locationId); }
 function allLocationShifts() { return S.data.shifts.filter(s => s.location_id === S.locationId); }
 function locationShifts() { return allLocationShifts().filter(s => (!S.team || s.department === S.team) && (!S.warehouse || s.warehouse === S.warehouse)); }
@@ -149,9 +162,9 @@ function visiblePeople() {
     .sort((a, b) => (departments.indexOf(defaultDepartment(a)) + 1 || 4) - (departments.indexOf(defaultDepartment(b)) + 1 || 4) || a.row_order - b.row_order || a.name.localeCompare(b.name));
 }
 function publication() { return readOnly ? null : S.data.publications.find(p => p.location_id === S.locationId); }
-function personHours(personId) { return S.data.shifts.filter(s => s.person_id === personId).reduce((sum, s) => sum + minutes(s), 0); }
+function personHours(personId) { return S.data.shifts.filter(s => s.person_id === personId).reduce((sum, s) => sum + rotaMinutes(s), 0); }
 function dayMetrics(date) {
-  const shifts = locationShifts().filter(s => s.date === date && ['work', 'training'].includes(s.kind));
+  const shifts = locationShifts().filter(s => s.date === date && ['work', 'training'].includes(s.kind) && !isNoShow(s));
   return { count: new Set(shifts.map(s => s.person_id)).size, minutes: shifts.reduce((sum, s) => sum + minutes(s), 0) };
 }
 function renderLogin() {
@@ -164,20 +177,49 @@ function renderLogin() {
     finally { button.disabled = false; }
   };
 }
-function attendanceRecord(personId, date) {
-  return (S.data.attendance || []).find(a => a.person_id === personId && a.location_id === S.locationId && a.date === date);
+function attendanceRecord(personId, date, locationId = S.locationId) {
+  return [...(S.data.attendance || []), ...(S.data.previousAttendance || [])].find(a => a.person_id === personId && a.location_id === locationId && a.date === date);
+}
+function isNoShow(shift) {
+  return !readOnly && attendanceRecord(shift.person_id, shift.date, shift.location_id)?.status === 'no_show';
+}
+function rotaMinutes(shift) { return isNoShow(shift) ? 0 : minutes(shift); }
+const FTE_WEEK_MINUTES = 40 * 60;
+const fteValue = totalMinutes => (totalMinutes / FTE_WEEK_MINUTES).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+function rotaSummary() {
+  const people = visiblePeople(), ids = new Set(people.map(person => person.id));
+  const totalMinutes = locationShifts().filter(shift => ids.has(shift.person_id) && ['work', 'training'].includes(shift.kind))
+    .reduce((total, shift) => total + rotaMinutes(shift), 0);
+  return { people, totalMinutes };
+}
+function updateHeadingSummary() {
+  const summary = document.querySelector('.heading-summary'); if (!summary) return;
+  const { people, totalMinutes } = rotaSummary();
+  summary.querySelector('[data-summary-colleagues]').textContent = people.length;
+  summary.querySelector('[data-summary-hours]').textContent = `${hours(totalMinutes)}h`;
+  if (summary.querySelector('[data-summary-fte]')) {
+    summary.querySelector('[data-summary-fte]').textContent = fteValue(totalMinutes);
+    summary.querySelector('[data-summary-fte-hours]').textContent = `${hours(totalMinutes)}h`;
+  }
+}
+function shiftLabel(shift) {
+  const label = String(shift.label || '').trim();
+  return label === 'Shift' || label === kindNames[shift.kind] ? '' : label;
 }
 function shiftCard(shift, weekly = false) {
   const working = ['work', 'training'].includes(shift.kind);
-  const noShow = weekly === true && !readOnly && working && attendanceRecord(shift.person_id, shift.date)?.status === 'no_show';
+  const noShow = weekly === true && working && isNoShow(shift);
   const overnight = working && shift.end_time < shift.start_time;
-  const detail = working ? `${hours(minutes(shift))}h${shift.break_minutes ? shift.break_start ? ` · Break ${shift.break_start}–${clockLabel(clockMinutes(shift.break_start) + shift.break_minutes)}` : ` · ${shift.break_minutes}m break (time unset)` : ''}` : 'All day';
-  const assignment = [shift.department, shift.warehouse].filter(Boolean).join(' · ');
+  const label = shiftLabel(shift);
+  const availabilityConflict = !readOnly ? availabilityWarning(S.data.people.find(p => p.id === shift.person_id), shift) : '';
+  const detail = working ? `${hours(minutes(shift))}h${shift.break_minutes ? shift.break_start ? ` · Break ${shift.break_start}–${clockLabel(clockMinutes(shift.break_start) + shift.break_minutes)}` : ` · ${shift.break_minutes}m break (time unset)` : ''}` : !readOnly && shift.kind === 'holiday' ? `${shift.holiday_minutes == null ? 'Usual day' : hours(shift.holiday_minutes) + 'h leave'} · ${shift.holiday_approved === 0 ? 'Pending' : 'Approved'}` : 'All day';
+  const position = packingPositionLabel(shift, S.data.packingStations);
+  const assignment = [shift.department, shift.warehouse, position].filter(Boolean).join(' · ');
   const shortWarehouse = shift.warehouse === 'Warehouse 1' ? 'WH1' : shift.warehouse === 'Warehouse 2' ? 'WH2' : shift.warehouse;
   const untimedBreak = `<span class="break-untimed-full">${shift.break_minutes}m break (time unset)</span><span class="break-untimed-compact">Break ${shift.break_minutes}m · unset</span>`;
   const breakDetail = working && shift.break_minutes ? `<span class="shift-net">${hours(minutes(shift))}h · </span>${shift.break_start ? `Break ${h(shift.break_start)}–${clockLabel(clockMinutes(shift.break_start) + shift.break_minutes)}` : untimedBreak}` : h(detail);
-  const title = [shift.label, working ? `${shift.start_time}–${shift.end_time}${overnight ? ' +1' : ''}` : kindNames[shift.kind], assignment, detail, noShow ? 'No show' : ''].filter(Boolean).join(' · ');
-  const content = `<span class="shift-time">${working ? `${h(shift.start_time)}–${h(shift.end_time)}${overnight ? '<sup>+1</sup>' : ''}` : h(kindNames[shift.kind])}${shift.kind === 'training' ? '<span class="training-mark">Training</span>' : ''}</span><span class="shift-label">${h(shift.label)}</span>${assignment || working ? `<span class="shift-assignment" title="${h(assignment)}">${assignment ? [shift.department, shortWarehouse].filter(Boolean).map(v => `<span>${h(v)}</span>`).join(' · ') : 'Set department and warehouse'}${working && !shift.warehouse && assignment ? ' · Set warehouse' : ''}</span>` : ''}<span class="shift-detail">${noShow ? '<span class="weekly-no-show">No show</span>' : breakDetail}</span>`;
+  const title = [shift.label, working ? `${shift.start_time}–${shift.end_time}${overnight ? ' +1' : ''}` : kindNames[shift.kind], assignment, detail, noShow ? 'No show' : '', availabilityConflict ? 'Outside availability' : ''].filter(Boolean).join(' · ');
+  const content = `<span class="shift-time"><span class="shift-clock">${working ? `${h(shift.start_time)}–${h(shift.end_time)}${overnight ? '<sup>+1</sup>' : ''}` : h(kindNames[shift.kind])}</span>${availabilityConflict ? `<span class="availability-flag" title="${h(availabilityConflict)}" aria-label="Outside availability">!</span>` : ''}${shift.kind === 'training' ? '<span class="training-mark">Training</span>' : ''}${label ? `<span class="shift-tag" title="${h(label)}">${h(label)}</span>` : ''}</span><span class="shift-label">${h(shift.label)}</span>${assignment || working ? `<span class="shift-assignment" title="${h(assignment)}">${assignment ? [shift.department, shortWarehouse, position].filter(Boolean).map(v => `<span>${h(v)}</span>`).join(' · ') : 'Set department and warehouse'}${working && !shift.warehouse && assignment ? ' · Set warehouse' : ''}</span>` : ''}<span class="shift-detail">${noShow ? '<span class="weekly-no-show">No show</span>' : breakDetail}</span>`;
   return readOnly ? `<div class="shift-card ${h(working ? departmentColour[shift.department] || shift.colour : shift.kind)}" title="${h(title)}">${content}</div>` : `<button class="shift-card ${h(working ? departmentColour[shift.department] || shift.colour : shift.kind)}" draggable="true" title="${h(title)} · Drag to another day or colleague" data-action="edit-shift" data-id="${h(shift.id)}" aria-label="Edit ${h(title)} on ${h(shift.date)}">${content}</button>`;
 }
 function renderGrid() {
@@ -203,7 +245,7 @@ function renderGrid() {
       return `<td class="shift-cell ${date === londonToday() ? 'today-column' : ''} ${noShow ? 'no-show-cell' : ''}" ${!readOnly && p.active ? `data-drop-person="${h(p.id)}" data-drop-date="${date}"` : ''}>${entries.map(s => shiftCard(s, true)).join('')}${standalone ? `<span class="weekly-no-show standalone" title="Saved attendance record; no work shift on this day" aria-label="No show for ${h(p.name)} on ${shortDate(date)}">No show</span>` : ''}${!readOnly && p.active ? `<button class="cell-add ${entries.length || noShow ? 'small' : ''}" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)} on ${shortDate(date)}">${icon('plus')}</button>` : !entries.length && !noShow ? '<span class="off-day">—</span>' : ''}</td>`;
     }).join('');
     const initials = p.name.split(/\s+/).slice(0, 2).map(n => n[0]).join('');
-    return `${separator}<tr class="colleague-row">${!readOnly ? `<td class="check-cell"><input type="checkbox" data-select-person="${h(p.id)}" aria-label="Select ${h(p.name)}" ${S.selected.has(p.id) ? 'checked' : ''} ${p.active ? '' : 'disabled'}></td>` : ''}<th class="person-column" scope="row"><div class="person-name-row"><span class="avatar">${h(initials)}</span><span>${readOnly ? `<span class="person-name" title="${h(p.name)}">${h(p.name)}</span>` : `<button class="person-name profile-link" title="${h(p.name)}" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role" title="${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}">${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}</span></span></div></th>${cells}<td class="hours-column ${over ? 'over-hours' : ''}" title="${readOnly ? 'Scheduled hours' : 'Scheduled hours across all locations'}"><strong>${hours(total)}<small>h</small></strong>${!readOnly && p.contract_minutes > 0 ? `<span>of ${hours(p.contract_minutes)}h</span>` : ''}</td></tr>`;
+    return `${separator}<tr class="colleague-row">${!readOnly ? `<td class="check-cell"><input type="checkbox" data-select-person="${h(p.id)}" aria-label="Select ${h(p.name)}" ${S.selected.has(p.id) ? 'checked' : ''} ${p.active ? '' : 'disabled'}></td>` : ''}<th class="person-column" scope="row"><div class="person-name-row"><span class="avatar">${h(initials)}</span><span>${readOnly ? `<span class="person-name" title="${h(p.name)}">${h(p.name)}</span>` : `<button class="person-name profile-link" title="${h(p.name)}" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role" title="${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}">${h(p.role || departmentName(p))}${p.is_example ? ' · Example' : ''}${!readOnly && !p.active ? ' · Archived' : ''}</span></span></div></th>${cells}<td class="hours-column ${over ? 'over-hours' : ''}" title="${readOnly ? 'Scheduled hours' : 'Hours after unpaid breaks and no shows, across all locations'}"><strong>${hours(total)}<small>h</small></strong>${!readOnly && p.contract_minutes > 0 ? `<span>of ${hours(p.contract_minutes)}h</span>` : ''}</td></tr>`;
   }).join('');
   return `<div class="rota-scroll" tabindex="0" aria-label="Weekly rota; scroll to see all colleagues and days"><table class="rota-table ${readOnly ? 'read-only' : ''}"><thead><tr>${!readOnly ? `<th class="check-cell" scope="col"><input id="select-all" type="checkbox" aria-label="Select all visible colleagues" ${allSelected ? 'checked' : ''}></th>` : ''}<th class="person-column" scope="col">Colleague <span class="muted">${people.length}</span></th>${head}<th class="hours-column" scope="col">Hours</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
@@ -212,11 +254,64 @@ function renderDay() {
   const scheduledDay = days.findIndex((_, index) => locationShifts().some(shift => shift.date === plusDays(S.week, index)));
   const emptyDay = !shifts.length ? `<div class="day-notice" role="status"><span>No shifts ${S.team || S.warehouse ? 'match these filters ' : ''}on ${h(shortDate(date, { weekday: 'long' }))}.${scheduledDay >= 0 ? ' Shifts are scheduled on other days this week.' : ''}</span><div>${scheduledDay >= 0 ? `<button class="button compact" data-action="day" data-day="${scheduledDay}">Show ${days[scheduledDay]}</button>` : ''}<button class="button compact" data-action="view-week">View full week</button></div></div>` : '';
   const tabs = days.map((d, i) => `<button class="day-tab ${i === S.day ? 'active' : ''}" data-action="day" data-day="${i}" data-drop-date="${plusDays(S.week, i)}" aria-pressed="${i === S.day}"><span>${d}</span><strong>${shortDate(plusDays(S.week, i), { month: undefined })}</strong><small>${dayMetrics(plusDays(S.week, i)).count} on</small></button>`).join('');
-  const rows = people.map(p => {
-    const entries = shifts.filter(s => s.person_id === p.id);
-    return `<article class="day-person" data-person="${h(p.id)}" data-date="${date}" ${!readOnly && p.active ? `data-drop-person="${h(p.id)}" data-drop-date="${date}"` : ''}><div class="day-person-name">${readOnly ? `<strong>${h(p.name)}</strong>` : `<button class="profile-link" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role">${h(departmentName(p))}${p.role ? ` · ${h(p.role)}` : ''}</span></div><div class="day-shifts">${entries.length ? entries.map(shiftCard).join('') : '<span class="off-label">No shift</span>'}${!readOnly && p.active ? `<button class="button compact" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)}">${icon('plus')}</button>` : ''}</div>${!readOnly ? attendanceControls(p, entries, date) : ''}</article>`;
+  const row = (p, entries) => {
+    const assignedDepartments = [...new Set(entries.filter(s => ['work', 'training'].includes(s.kind)).map(s => s.department).filter(Boolean))];
+    return `<article class="day-person" data-person="${h(p.id)}" data-date="${date}" ${!readOnly && p.active ? `data-drop-person="${h(p.id)}" data-drop-date="${date}"` : ''}><div class="day-person-name">${readOnly ? `<strong>${h(p.name)}</strong>` : `<button class="profile-link" data-action="profile" data-person="${h(p.id)}">${h(p.name)}</button>`}<span class="person-role">${h(assignedDepartments.join(' / ') || departmentName(p))}${p.role ? ` · ${h(p.role)}` : ''}</span></div><div class="day-shifts">${entries.length ? entries.map(shiftCard).join('') : '<span class="off-label">No shift</span>'}${!readOnly && p.active ? `<button class="button compact" data-action="add-cell" data-person="${h(p.id)}" data-date="${date}" aria-label="Add shift for ${h(p.name)}">${icon('plus')}</button>` : ''}</div>${!readOnly ? attendanceControls(p, entries, date) : ''}</article>`;
+  };
+  const section = (name, entries, colleagues, colour = '') => {
+    const scheduled = entries.filter(s => ['work', 'training'].includes(s.kind));
+    const on = scheduled.filter(s => !isNoShow(s));
+    const count = set => new Set(set.map(s => s.person_id)).size;
+    const counts = scheduled.length ? `<span class="department-day-count">${count(on)} on · ${count(scheduled)} scheduled</span><span class="warehouse-day-count">WH1 ${count(on.filter(s => s.warehouse === 'Warehouse 1'))} · WH2 ${count(on.filter(s => s.warehouse === 'Warehouse 2'))}${on.some(s => !s.warehouse) ? ` · Unassigned ${count(on.filter(s => !s.warehouse))}` : ''}</span>` : `<span class="department-day-count">${colleagues.length} colleagues</span>`;
+    const content = name === 'Packing' ? packingDayHTML(date, entries, colleagues, row) : colleagues.map(p => row(p, entries.filter(s => s.person_id === p.id))).join('') || '<p class="department-empty">No shifts in this section.</p>';
+    return `<section class="day-department ${colour}" data-department="${h(name)}"><div class="day-department-heading"><h3>${h(name)}</h3>${counts}${name === 'Packing' && !readOnly ? '<button class="button compact" data-action="packing-stations">Manage stations</button>' : ''}</div>${content}</section>`;
+  };
+  let sections = departments.filter(d => !S.team || S.team === d).map(d => {
+    const entries = shifts.filter(s => ['work', 'training'].includes(s.kind) && s.department === d);
+    return section(d, entries, people.filter(p => entries.some(s => s.person_id === p.id)), departmentColour[d]);
   }).join('');
-  return `<section class="day-view ${readOnly ? 'read-only' : ''}" data-selected-date="${date}"><div class="day-tabs" aria-label="Choose day">${tabs}</div><div class="day-heading"><h2>${h(shortDate(date, { weekday: 'long', year: 'numeric' }))}</h2>${!readOnly ? `<div class="day-actions"><button class="button compact" data-action="day-hours" data-date="${date}">Set required hours</button><button class="button compact danger" data-action="clear-day" data-date="${date}" ${allLocationShifts().some(s => s.date === date) ? '' : 'disabled'}>Clear day</button></div>` : ''}</div>${!readOnly ? dayPlanningHTML(date) : ''}${emptyDay}<div class="day-list">${rows || '<div class="empty-state"><h2>No colleagues to show</h2><p>Try a different filter or add colleagues.</p></div>'}</div></section>`;
+  const other = shifts.filter(s => !['work', 'training'].includes(s.kind) || !departments.includes(s.department));
+  const remaining = people.filter(p => other.some(s => s.person_id === p.id) || !shifts.some(s => s.person_id === p.id));
+  if (remaining.length) sections += section('Absences & no shift', other, remaining);
+  return `<section class="day-view ${readOnly ? 'read-only' : ''}" data-selected-date="${date}"><div class="day-tabs" aria-label="Choose day">${tabs}</div><div class="day-heading"><h2>${h(shortDate(date, { weekday: 'long', year: 'numeric' }))}</h2>${!readOnly ? `<div class="day-actions"><button class="button compact" data-action="copy-day" data-date="${date}">${icon('copy')}Copy day</button><button class="button compact" data-action="day-hours" data-date="${date}">Set required hours</button><button class="button compact danger" data-action="clear-day" data-date="${date}" ${allLocationShifts().some(s => s.date === date) ? '' : 'disabled'}>Clear day</button></div>` : ''}</div>${!readOnly ? dayPlanningHTML(date) + dayDashboardHTML(date) : ''}${emptyDay}<p class="day-section-help">Assigned departments${readOnly ? '' : ' · “On” excludes no shows'} · Split shifts appear in each section.</p><div class="day-list">${sections}</div></section>`;
+}
+function packingDayHTML(date, entries, colleagues, row) {
+  const carryover = [...(S.data.shifts || []), ...(S.data.previousShifts || []), ...(S.data.packingCarryover || [])].filter(s => isPackingShift(s) && s.location_id === S.locationId && s.date === plusDays(date, -1) && s.end_time < s.start_time && s.end_time !== '00:00' && s.packing_station_id && (!S.warehouse || s.warehouse === S.warehouse));
+  const stations = (S.data.packingStations || []).filter(s => s.location_id === S.locationId && (!S.warehouse || s.warehouse === S.warehouse) && (s.active !== 0 || [...entries, ...carryover].some(shift => shift.packing_station_id === s.id)));
+  const unassigned = entries.filter(s => !s.packing_station_id || !stations.some(station => station.id === s.packing_station_id));
+  const unassignedRows = colleagues.filter(p => unassigned.some(s => s.person_id === p.id)).map(p => row(p, unassigned.filter(s => s.person_id === p.id))).join('');
+  if (!stations.length) return `${!readOnly ? '<p class="packing-help">Add packing stations to plan pairs such as 1A / 1B. Existing shifts stay unassigned until you choose a position.</p>' : ''}${unassignedRows || '<p class="department-empty">No shifts in this section.</p>'}`;
+  const name = shift => S.data.people.find(p => p.id === shift.person_id)?.name || shift.person_name || 'Colleague';
+  const boards = warehouses.filter(warehouse => stations.some(s => s.warehouse === warehouse)).map(warehouse => `<section class="packing-warehouse" data-packing-warehouse="${h(warehouse)}"><h4>${h(warehouse)} <span>Packing stations</span></h4><div class="packing-station-grid">${stations.filter(s => s.warehouse === warehouse).sort((a, b) => a.number - b.number).map(station => {
+    const assignments = entries.filter(s => s.packing_station_id === station.id), earlier = carryover.filter(s => s.packing_station_id === station.id);
+    const card = shift => `<article class="packing-assignment" data-packing-shift="${h(shift.id)}"><div class="packing-person-name">${readOnly ? `<strong>${h(name(shift))}</strong>` : `<button class="profile-link" data-action="profile" data-person="${h(shift.person_id)}">${h(name(shift))}</button>`}${!readOnly && isNoShow(shift) ? '<span class="packing-no-show">No show</span>' : ''}</div>${shiftCard(shift)}${!readOnly ? `${attendanceControls(S.data.people.find(p => p.id === shift.person_id), [shift], date)}<button class="text-button packing-unassign" data-action="packing-unassign" data-id="${h(shift.id)}" aria-label="Unassign position for ${h(name(shift))}">Unassign position</button>` : ''}</article>`;
+    const slots = ['A', 'B'].map(position => {
+      const shifts = assignments.filter(s => s.packing_position === position), previous = earlier.filter(s => s.packing_position === position);
+      return `<section class="packing-position" aria-label="${h(warehouse)} position ${station.number}${position}" ${!readOnly ? `data-packing-drop="${h(station.id)}" data-packing-position="${position}" data-date="${date}" data-warehouse="${h(warehouse)}"` : ''}><div class="packing-position-heading"><strong>${station.number}${position}</strong>${!readOnly ? `<button class="text-button" data-action="packing-choose" data-station="${h(station.id)}" data-position="${position}" data-date="${date}">Choose shift</button>` : ''}</div>${previous.map(s => `<div class="packing-carryover"><strong>${h(name(s))}</strong><span>Until ${h(s.end_time)} · from ${h(shortDate(s.date, { weekday: 'short' }))}</span></div>`).join('')}${shifts.map(card).join('')}${!shifts.length && !previous.length ? `<p class="packing-empty">${readOnly ? 'Unassigned' : 'Drag a Packing shift here'}</p>` : ''}</section>`;
+    }).join('');
+    const hasBoth = assignments.some(s => s.packing_position === 'A') && assignments.some(s => s.packing_position === 'B');
+    const noOverlap = hasBoth && !assignments.some(a => assignments.some(b => a.packing_position !== b.packing_position && packingIntervalsOverlap(a, b)));
+    return `<section class="packing-station" data-packing-station="${h(station.id)}"><h5>Station ${station.number}${station.active === 0 ? ' · Archived' : ''}</h5><div class="packing-pair">${slots}</div>${noOverlap ? '<p class="packing-help">These A/B shifts do not overlap.</p>' : ''}</section>`;
+  }).join('')}</div></section>`).join('');
+  return `<div class="packing-board">${!readOnly ? '<p class="packing-help">Drag a shift into an A/B position, or use Choose shift. Positions show both partners; name search filters the unassigned list. Publish when ready to share.</p>' : '<p class="packing-help">A and B share a station while their shift times overlap.</p>'}${boards}</div><div class="packing-unassigned"><div class="packing-unassigned-heading"><h4>Unassigned Packing shifts</h4>${!readOnly ? `<div class="packing-unassign-drop" data-packing-drop="" data-date="${date}" aria-label="Drop to unassign a packing position">Drop here to unassign a position</div>` : ''}</div>${unassignedRows || '<p class="department-empty">No unassigned shifts match your search.</p>'}</div>`;
+}
+async function assignPackingPosition(shift, station, position = '', date = shift.date) {
+  const scroller = document.querySelector('.day-list'), top = scroller?.scrollTop || 0;
+  await mutate(`/api/shifts/${shift.id}/packing-position`, { date, location_id: S.locationId, warehouse: station?.warehouse || shift.warehouse, packing_station_id: station?.id || null, packing_position: position }, 'PUT');
+  const next = document.querySelector('.day-list'); if (next) next.scrollTop = top;
+  toast(station ? `Position ${station.number}${position} saved. Publish the week when ready.` : 'Position unassigned. The shift is still saved.');
+}
+function openPackingChoice(stationId, position, date) {
+  const station = S.data.packingStations.find(s => s.id === stationId); if (!station) return;
+  const eligible = allLocationShifts().filter(s => s.date === date && isPackingShift(s) && s.warehouse === station.warehouse).sort((a, b) => S.data.people.find(p => p.id === a.person_id).name.localeCompare(S.data.people.find(p => p.id === b.person_id).name) || a.start_time.localeCompare(b.start_time));
+  modal(`Assign ${station.number}${position} · ${station.warehouse}`, `<p>${h(shortDate(date, { weekday: 'long' }))}. Choose an existing Packing shift. Its times and colleague stay the same.</p><label>Colleague’s shift<select id="packing-choice" required><option value="">Choose shift</option>${eligible.map(s => `<option value="${h(s.id)}">${h(S.data.people.find(p => p.id === s.person_id).name)} · ${h(s.start_time)}–${h(s.end_time)}${s.end_time < s.start_time ? ' +1' : ''}${s.packing_station_id ? ` · currently ${h(packingPositionLabel(s, S.data.packingStations))}` : ''}</option>`).join('')}</select></label>${!eligible.length ? '<p class="field-help">Add a Packing shift in this warehouse for this day first.</p>' : ''}`, `${cancel}<button class="button primary" ${!eligible.length ? 'disabled' : ''}>Assign position</button>`);
+  $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { await assignPackingPosition(eligible.find(s => s.id === $('packing-choice').value), station, position, date); closeDialog(); }); };
+}
+function openPackingStations() {
+  const stations = (S.data.packingStations || []).filter(s => s.location_id === S.locationId);
+  modal('Packing stations', `<p>Each station has an A and a B position. Add the station numbers you use in each warehouse, then assign shifts in Day view.</p><div class="field-row"><label>Warehouse<select id="packing-warehouse">${choices(warehouses, S.warehouse || 'Warehouse 1')}</select></label><label>First station<input id="packing-first" type="number" min="1" max="99" value="1" required></label><label>Last station<input id="packing-last" type="number" min="1" max="99" value="4" required></label></div><p class="field-help">For example, 1 to 4 adds 1A/1B through 4A/4B. Existing station numbers are kept.</p><div class="packing-station-management">${warehouses.map(warehouse => `<section><h3>${h(warehouse)}</h3>${stations.filter(s => s.warehouse === warehouse).map(s => `<div class="packing-station-setting"><span>Station ${s.number} · ${s.number}A / ${s.number}B${s.active ? '' : ' · Archived'}</span><button type="button" class="text-button" data-packing-toggle="${h(s.id)}" data-active="${s.active ? '0' : '1'}">${s.active ? 'Archive' : 'Restore'}</button></div>`).join('') || '<p class="field-help">No stations set up.</p>'}</section>`).join('')}</div><p class="field-help">Archiving retains past assignments. Unassign current and future shifts from a station first. Settings → Download data backup saves a complete copy of the rota.</p>`, '<button type="button" class="button" data-action="close-modal">Done</button><button class="button primary">Add stations</button>', true);
+  $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { const result = await mutate('/api/packing-stations', { location_id: S.locationId, warehouse: $('packing-warehouse').value, start_number: Number($('packing-first').value), end_number: Number($('packing-last').value) }); openPackingStations(); toast(`${result.created} stations added · ${result.restored} restored · ${result.existing} already set up.`); }); };
+  for (const button of $('dialog-form').querySelectorAll('[data-packing-toggle]')) button.onclick = () => formAction($('dialog-form'), async () => { await mutate(`/api/packing-stations/${button.dataset.packingToggle}`, { active: button.dataset.active === '1' }, 'PUT'); openPackingStations(); });
 }
 function attendanceControls(p, entries, date) {
   const record = attendanceRecord(p.id, date);
@@ -224,22 +319,80 @@ function attendanceControls(p, entries, date) {
   if (!scheduled && !record) return '<div class="attendance-controls"></div>';
   const available = date <= londonToday();
   const button = (status, label) => `<button class="attendance-button ${record?.status === status ? 'marked ' + status : ''}" data-action="attendance" data-person="${h(p.id)}" data-date="${date}" data-status="${status}" aria-label="${label} for ${h(p.name)} on ${shortDate(date)}" aria-pressed="${record?.status === status}" ${!available || !scheduled ? 'disabled' : ''}>${status === 'checked_in' && record?.status === status ? 'Checked in' : label}</button>`;
-  return `<div class="attendance-controls" title="${record ? `Marked ${h(new Date(record.marked_at).toLocaleString('en-GB', { timeZone: 'Europe/London' }))}` : available ? 'Manager attendance record for this day' : 'Attendance is available on the shift date'}">${scheduled ? button('checked_in', 'Check in') + button('no_show', 'No show') : `<span class="attendance-record ${record.status}">${record.status === 'checked_in' ? 'Checked in' : 'No show'} · no work shift</span>`}${record ? `<button class="attendance-clear" data-action="attendance" data-person="${h(p.id)}" data-date="${date}" data-status="unmarked" aria-label="Clear attendance for ${h(p.name)}">Clear</button>` : ''}</div>`;
+  const late = `<button class="attendance-button ${record?.is_late ? 'marked late' : ''}" data-action="arrival" data-person="${h(p.id)}" data-date="${date}" aria-label="Record arrival or late for ${h(p.name)}" ${!available ? 'disabled' : ''}>${record?.is_late ? `Late${record.late_minutes != null ? ` ${record.late_minutes}m` : ''}` : 'Arrival / late'}</button>`;
+  return `<div class="attendance-controls" title="${record ? `Marked ${h(new Date(record.marked_at).toLocaleString('en-GB', { timeZone: 'Europe/London' }))}` : available ? 'Manager attendance record for this day' : 'Attendance is available on the shift date'}">${scheduled ? button('checked_in', 'Check in') + late + button('no_show', 'No show') : `<span class="attendance-record ${record.status}">${record.status === 'checked_in' ? record.is_late ? 'Late' : 'Checked in' : 'No show'} · no work shift</span>`}${record ? `<button class="attendance-clear" data-action="attendance" data-person="${h(p.id)}" data-date="${date}" data-status="unmarked" aria-label="Clear attendance for ${h(p.name)}">Clear</button>` : ''}${record?.arrival_time ? `<span class="arrival-record">Arrived ${h(record.arrival_time)}${record.arrival_date !== date ? ' +1 day' : ''}</span>` : ''}</div>`;
+}
+const dayStatusNames = { scheduled: 'Scheduled', checked_in: 'Checked in', late: 'Late', no_show: 'No show', holiday: 'Holiday', sick: 'Sick', unavailable: 'Unavailable', unmarked: 'Unmarked' };
+function dayDashboardHTML(date) {
+  const summary = managerDaySummary(S.data.people, S.data.shifts, S.data.attendance || [], date, S.locationId);
+  return `<div class="day-dashboard" aria-label="Daily colleague dashboard">${Object.entries(dayStatusNames).map(([key, label]) => `<button class="day-status ${key}" data-action="day-status" data-status="${key}" data-date="${date}" aria-label="${label}: ${summary[key].length} colleagues"><span>${label}</span><strong>${summary[key].length}</strong></button>`).join('')}</div><p class="day-dashboard-help">Both warehouses · All departments · Late colleagues are included in checked in.</p>`;
+}
+function openDayStatus(status, date) {
+  const ids = managerDaySummary(S.data.people, S.data.shifts, S.data.attendance || [], date, S.locationId)[status];
+  if (!ids) return;
+  const people = S.data.people.filter(p => ids.includes(p.id)).sort((a, b) => a.name.localeCompare(b.name));
+  modal(`${dayStatusNames[status]} · ${shortDate(date, { weekday: 'short' })}`, `${status === 'unavailable' ? '<p class="field-help">Includes unavailable absence entries and days with no available time in the weekly profile. Availability not set is not counted as unavailable. Holiday and sick have their own categories.</p>' : ''}<div class="management-list">${people.map(p => {
+    const entries = allLocationShifts().filter(s => s.date === date && s.person_id === p.id), record = attendanceRecord(p.id, date);
+    const detail = status === 'late' ? record?.arrival_time ? `Arrived ${record.arrival_time}${record.arrival_date !== date ? ' +1 day' : ''} · ${record.late_minutes}m late` : 'Marked late by manager' : entries.map(s => ['work', 'training'].includes(s.kind) ? `${s.start_time}–${s.end_time} · ${s.department || 'Unassigned'} · ${s.warehouse.replace('Warehouse ', 'WH')}` : kindNames[s.kind]).join(' / ') || 'Unavailable in weekly profile';
+    return `<button type="button" class="management-row" data-action="profile" data-person="${h(p.id)}"><span><strong>${h(p.name)}</strong><small>${h(detail)}</small></span><span class="edit-label">Profile</span></button>`;
+  }).join('') || '<p class="field-help">No colleagues in this category for this day.</p>'}</div>`, '<button type="button" class="button" data-action="close-modal">Done</button>');
+}
+function openArrival(id, date) {
+  const p = S.data.people.find(p => p.id === id), record = attendanceRecord(id, date);
+  const first = allLocationShifts().filter(s => s.date === date && s.person_id === id && ['work', 'training'].includes(s.kind)).sort((a, b) => a.start_time.localeCompare(b.start_time))[0];
+  if (!p || !first) return;
+  modal(`Arrival · ${p.name}`, `<p>${h(shortDate(date, { weekday: 'long' }))} · First shift ${h(first.start_time)}–${h(first.end_time)}${first.end_time < first.start_time ? ' +1 day' : ''}</p><label>Arrival time <span class="optional">optional</span><input id="arrival-time" type="time" value="${h(record?.arrival_time || '')}"></label><label>Arrival date<select id="arrival-date"><option value="${date}">${shortDate(date)}</option>${first.end_time < first.start_time ? `<option value="${plusDays(date, 1)}" ${record?.arrival_date === plusDays(date, 1) ? 'selected' : ''}>${shortDate(plusDays(date, 1))} · next day</option>` : ''}</select></label><label class="check-label"><input id="arrival-late" type="checkbox" ${record?.is_late ? 'checked' : ''}>Mark as late when no arrival time is known</label><p class="field-help">With an arrival time, lateness is calculated against the first shift’s start. Without a time, select the box to mark late manually. The time you record attendance does not determine lateness. Late colleagues remain checked in; their planned rota hours stay the same.</p>`, `${cancel}<button type="submit" class="button primary">Save arrival</button>`);
+  const update = () => { $('arrival-late').disabled = Boolean($('arrival-time').value); }; $('arrival-time').oninput = update; update();
+  $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => {
+    const result = await mutate('/api/attendance', { person_id: id, location_id: S.locationId, date, status: $('arrival-time').value || !$('arrival-late').checked ? 'checked_in' : 'late', arrival_time: $('arrival-time').value || null, arrival_date: $('arrival-date').value });
+    closeDialog(); toast(result.is_late ? 'Late arrival saved.' : 'Arrival saved. Colleague checked in.');
+  }); };
 }
 function dayPlanningHTML(date) {
   const plan = (S.data.dayPlans || []).find(p => p.location_id === S.locationId && p.date === date);
   const dayShifts = allLocationShifts().filter(s => s.date === date && ['work', 'training'].includes(s.kind));
-  const scheduled = dayShifts.reduce((total, s) => total + minutes(s), 0);
+  const scheduled = dayShifts.reduce((total, s) => total + rotaMinutes(s), 0);
   const required = plan?.requirement_minutes ?? null;
   const people = new Set(dayShifts.map(s => s.person_id));
+  const availablePeople = new Set(dayShifts.filter(s => !isNoShow(s)).map(s => s.person_id));
   const attendance = (S.data.attendance || []).filter(a => a.location_id === S.locationId && a.date === date && people.has(a.person_id));
   const checked = attendance.filter(a => a.status === 'checked_in').length, absent = attendance.filter(a => a.status === 'no_show').length;
-  return `<div class="day-planning"><div class="day-stat"><span>Scheduled</span><strong>${hours(scheduled)}<small>h</small></strong><small>${people.size} colleagues · after unpaid breaks</small></div><div class="day-stat ${required !== null && scheduled < required ? 'short' : ''}"><span>Required</span><strong>${required === null ? '—' : hours(required) + '<small>h</small>'}</strong><small>${required === null ? 'Set the hours you need' : scheduled < required ? `${hours(required - scheduled)}h short` : scheduled === required ? 'Requirement met' : `${hours(scheduled - required)}h above requirement`}</small></div></div><p class="day-scope">Hours cover ${h(currentLocation().name)}, both warehouses and all departments. Overnight hours count on the shift’s start date.${date <= londonToday() ? ` <span class="attendance-summary">${checked} checked in · ${absent} no show · ${people.size - checked - absent} unmarked</span>` : ' Attendance opens on the shift date.'}</p>`;
+  return `<div class="day-planning"><div class="day-stat"><span>Scheduled</span><strong>${hours(scheduled)}<small>h</small></strong><small>${availablePeople.size} colleagues · after unpaid breaks · excludes no shows</small></div><div class="day-stat ${required !== null && scheduled < required ? 'short' : ''}"><span>Required</span><strong>${required === null ? '—' : hours(required) + '<small>h</small>'}</strong><small>${required === null ? 'Set the hours you need' : scheduled < required ? `${hours(required - scheduled)}h short` : scheduled === required ? 'Requirement met' : `${hours(scheduled - required)}h above requirement`}</small></div></div><p class="day-scope">Hours cover ${h(currentLocation().name)}, both warehouses and all departments. Overnight hours count on the shift’s start date.${date <= londonToday() ? ` <span class="attendance-summary">${checked} checked in · ${absent} no show · ${people.size - checked - absent} unmarked</span>` : ' Attendance opens on the shift date.'}</p>`;
 }
 function openDayHours(date) {
   const plan = (S.data.dayPlans || []).find(p => p.location_id === S.locationId && p.date === date);
-  modal('Required hours', `<p>${h(shortDate(date, { weekday: 'long', year: 'numeric' }))} · ${h(currentLocation().name)}</p><label>Required hours<input id="day-required" type="number" min="0" max="10000" step="0.01" value="${plan?.requirement_minutes == null ? '' : Number((plan.requirement_minutes / 60).toFixed(2))}" placeholder="e.g. 320"></label><p class="field-help">Set the total hours needed for both warehouses and all departments at this location. Leave blank to remove the requirement. Scheduled hours exclude unpaid breaks and absences.</p>`, `${cancel}<button type="submit" class="button primary">Save hours</button>`);
+  modal('Required hours', `<p>${h(shortDate(date, { weekday: 'long', year: 'numeric' }))} · ${h(currentLocation().name)}</p><label>Required hours<input id="day-required" type="number" min="0" max="10000" step="0.01" value="${plan?.requirement_minutes == null ? '' : Number((plan.requirement_minutes / 60).toFixed(2))}" placeholder="e.g. 320"></label><p class="field-help">Set the total hours needed for both warehouses and all departments at this location. Leave blank to remove the requirement. Scheduled hours exclude unpaid breaks, absences and no shows.</p>`, `${cancel}<button type="submit" class="button primary">Save hours</button>`);
   $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { await mutate('/api/day-plans', { location_id: S.locationId, date, requirement_hours: $('day-required').value }); closeDialog(); toast('Required hours saved.'); }); };
+}
+function openCopyDay(sourceDate) {
+  const locationId = S.locationId;
+  modal('Copy a day’s shifts', `<p>Copy work and training shifts across both warehouses and all departments at ${h(currentLocation().name)}. Existing shifts stay in place. Holiday, sick and unavailable entries, attendance and required hours are not copied.</p><div class="field-row"><label>Copy from<input id="copy-source-date" type="date" min="2020-01-01" max="2100-12-31" value="${sourceDate}" required></label><label>Copy into<input id="copy-target-date" type="date" min="2020-01-01" max="2100-12-31" value="${plusDays(sourceDate, 1)}" required></label></div><label class="check-label"><input id="copy-override-availability" type="checkbox">Allow shifts outside saved availability</label><p class="field-help">Overlaps and archived colleagues are skipped. Times, department, warehouse, breaks, labels and manager notes are retained.</p><button type="button" class="button" id="copy-day-preview-button">Preview copy</button><div id="copy-day-preview" class="fill-preview" aria-live="polite"></div>`, `${cancel}<button type="submit" class="button primary" id="copy-day-save" disabled>Copy shifts to draft</button>`, true);
+  const form = $('dialog-form'), preview = $('copy-day-preview');
+  let plan = null, sequence = 0;
+  const read = () => ({ location_id: locationId, source_date: $('copy-source-date').value, target_date: $('copy-target-date').value, override_availability: $('copy-override-availability').checked });
+  const invalidate = () => { sequence++; plan = null; $('copy-day-save').disabled = true; preview.innerHTML = ''; };
+  form.addEventListener('input', invalidate); form.addEventListener('change', invalidate);
+  $('copy-day-preview-button').onclick = async () => {
+    if (!form.reportValidity()) return;
+    const request = ++sequence, body = read(); plan = null; $('copy-day-save').disabled = true;
+    $('form-error').textContent = ''; $('copy-day-preview-button').disabled = true;
+    preview.innerHTML = '<p class="field-help">Checking destination shifts and availability…</p>';
+    try {
+      const params = new URLSearchParams({ locationId, sourceDate: body.source_date, targetDate: body.target_date, overrideAvailability: String(body.override_availability) });
+      const result = await api(`/api/days/copy-plan?${params}`);
+      if (request !== sequence || !preview.isConnected) return;
+      if (result.revision !== S.data.revision) { await load(); if (request === sequence && preview.isConnected) { preview.innerHTML = ''; $('form-error').textContent = 'The rota changed. The latest version is loaded; preview the copy again.'; } return; }
+      plan = { ...result, body };
+      preview.innerHTML = `<h3>${result.shifts.length} shifts to copy · ${hours(result.total_minutes)}h</h3>${result.shifts.length ? `<div class="fill-shift-list">${result.shifts.map(s => `<div><strong>${h(S.data.people.find(p => p.id === s.person_id)?.name)}</strong><span>${h(s.start_time)}–${h(s.end_time)}${s.end_time < s.start_time ? ' +1' : ''}${shiftLabel(s) ? ` · ${h(shiftLabel(s))}` : ''}</span><small>${h(s.department || 'Unassigned department')} · ${h(s.warehouse || 'Unassigned warehouse')} · ${s.break_minutes}m break${s.break_start ? ` at ${h(s.break_start)}` : ''}</small></div>`).join('')}</div>` : '<p class="field-help">No shifts can be copied with these dates and options.</p>'}${result.skipped.length ? `<details class="fill-skipped" open><summary>${result.skipped.length} shifts skipped</summary><div class="fill-skipped-list">${result.skipped.map(s => `<p><strong>${h(s.name)}</strong> · ${h(s.reason)}</p>`).join('')}</div></details>` : ''}${result.warnings.length && body.override_availability ? `<div class="availability-warning"><strong>Availability overrides</strong>${result.warnings.map(w => `<p>${h(w.message)}</p>`).join('')}</div>` : ''}<p class="field-help">The copied shifts stay private until you publish the destination week.</p>`;
+      $('copy-day-save').disabled = !result.shifts.length;
+    } catch (error) { if (request === sequence && preview.isConnected) { preview.innerHTML = ''; $('form-error').textContent = error.message; } }
+    finally { if (preview.isConnected) $('copy-day-preview-button').disabled = false; }
+  };
+  form.onsubmit = event => { event.preventDefault(); if (!plan?.shifts.length) return; formAction(form, async () => {
+    if (plan.revision !== S.data.revision) throw new Error('The rota changed. Preview the copy again before saving.');
+    const result = await mutate('/api/days/copy', plan.body); closeDialog();
+    toast(`${result.copied} shifts copied to ${shortDate(result.target_date, { weekday: 'short' })}${result.skipped.length ? ` · ${result.skipped.length} skipped` : ''}. Publish the destination week when ready.`);
+  }).then(() => { if (preview.isConnected) $('copy-day-save').disabled = !plan?.shifts.length; }); };
 }
 function openClearRota(scope, date) {
   const locationId = S.locationId, week = S.week, loc = currentLocation(), reviewedRevision = S.data.revision;
@@ -247,7 +400,7 @@ function openClearRota(scope, date) {
   if (!entries.length) { toast('There are no draft shifts to clear.'); return; }
   const range = scope === 'day' ? shortDate(date, { weekday: 'long', year: 'numeric' }) : `${shortDate(week)} – ${shortDate(plusDays(week, 6), { year: 'numeric' })}`;
   const label = scope === 'day' ? 'Clear day' : 'Clear rota';
-  modal(`${label}?`, `<p><strong>${h(range)} · ${h(loc.name)}</strong></p><p>Remove all <strong>${entries.length} draft shift${entries.length === 1 ? '' : 's'}</strong> ${scope === 'day' ? 'on this date' : 'in this week'}, including holiday, sick and unavailable entries?</p><p>This covers both warehouses and all departments, including shifts hidden by filters.</p><p class="field-help">Colleagues, shift patterns, recorded attendance and required hours stay saved. The published rota stays unchanged until you publish these changes.</p>`, `${cancel}<button type="submit" class="button danger">${label}</button>`);
+  modal(`${label}?`, `<p><strong>${h(range)} · ${h(loc.name)}</strong></p><p>Remove all <strong>${entries.length} draft shift${entries.length === 1 ? '' : 's'}</strong> ${scope === 'day' ? 'on this date' : 'in this week'}, including holiday, sick and unavailable entries?</p><p>This covers both warehouses and all departments, including shifts hidden by filters.</p><p class="field-help">Colleagues, shift patterns, recorded attendance and required hours stay saved. Removing holiday entries restores their hours in the holiday tracker. The published rota stays unchanged until you publish these changes.</p>`, `${cancel}<button type="submit" class="button danger">${label}</button>`);
   $('dialog-form').onsubmit = event => {
     event.preventDefault();
     formAction(event.currentTarget, async () => {
@@ -263,7 +416,7 @@ function renderTimeline() {
   const tabs = `<div class="day-tabs">${days.map((d, i) => `<button class="day-tab ${i === S.day ? 'active' : ''}" data-action="day" data-day="${i}" aria-pressed="${i === S.day}"><span>${d}</span><strong>${shortDate(plusDays(S.week, i), { month: undefined })}</strong></button>`).join('')}</div>`;
   const controls = `<div class="coverage-controls"><label>Cover from<input id="coverage-start" type="time" value="${S.coverageStart}" ${S.coverageFull ? 'disabled' : ''}></label><label>Cover until<input id="coverage-end" type="time" value="${S.coverageEnd}" ${S.coverageFull ? 'disabled' : ''}></label><label>Minimum per department<input id="minimum-cover" type="number" min="0" max="100" value="${S.minimumCover}"></label><button class="button" data-action="coverage-full" aria-pressed="${Boolean(S.coverageFull)}">${S.coverageFull ? 'Use chosen hours' : 'Show 24 hours'}</button></div>`;
   if (!(end > start)) return tabs + controls + '<p class="coverage-help">Choose a finish after the start, or show 24 hours.</p>';
-  const shifts = [...(S.data.previousShifts || []), ...allLocationShifts()].filter(s => s.location_id === S.locationId);
+  const shifts = [...(S.data.previousShifts || []), ...allLocationShifts()].filter(s => s.location_id === S.locationId && !isNoShow(s));
   const x = value => Math.max(0, Math.min(1000, (value - start) / (end - start) * 1000));
   const axis = `<svg preserveAspectRatio="none" viewBox="0 0 1000 26" class="timeline-axis" aria-hidden="true">${Array.from({ length: Math.ceil((end - start) / 60) + 1 }, (_, i) => start + i * 60).filter(t => t <= end).map(t => `<text x="${x(t)}" y="18" text-anchor="${t === start ? 'start' : t === end ? 'end' : 'middle'}">${clockLabel(t)}</text>`).join('')}</svg>`;
   const groups = warehouses.filter(w => !S.warehouse || w === S.warehouse).map(warehouse => {
@@ -285,27 +438,25 @@ function renderTimeline() {
     }).join('');
     return `<section class="warehouse-timeline"><h3><span class="warehouse-badge">${warehouse === 'Warehouse 1' ? 'WH1' : 'WH2'}</span>${h(warehouse)}</h3><div class="timeline-row timeline-axis-row"><span class="timeline-name">${shortDate(date, { weekday: 'long' })}</span>${axis}</div>${sections}</section>`;
   }).join('');
-  return tabs + controls + '<p class="coverage-help">Numbers show planned cover after timed breaks. Attendance is recorded separately in Day view. Hatched sections are breaks. A ? means break times are still needed; cover is unconfirmed. Name search filters the individual rows, while coverage counts include the full department. Click a colleague’s bar to change their shift or break.</p>' + `<div class="timeline-scroll">${groups}</div>`;
+  return tabs + controls + '<p class="coverage-help">Numbers show cover after timed breaks, excluding colleagues marked No show in Day view. Hatched sections are breaks. A ? means break times are still needed; cover is unconfirmed. Name search filters the individual rows, while coverage counts include the full department. Click a colleague’s bar to change their shift or break.</p>' + `<div class="timeline-scroll">${groups}</div>`;
 }
 function render() {
   const data = S.data; if (!data) return;
-  const loc = currentLocation(), people = visiblePeople(), shifts = locationShifts();
-  const work = shifts.filter(s => ['work', 'training'].includes(s.kind));
-  const total = work.reduce((sum, s) => sum + minutes(s), 0);
+  const loc = currentLocation(), { people, totalMinutes: total } = rotaSummary();
   const pub = publication();
   const status = readOnly ? 'Published rota' : pub ? pub.dirty ? 'Changes to publish' : 'Published' : 'Private draft';
   const end = plusDays(S.week, 6);
   $('app').innerHTML = `<header class="topbar"><a class="brand" href="${readOnly ? h(location.pathname) : '/'}"><span class="brand-symbol">${icon('calendar')}</span><span>DYLAN OAKS <small>ROTA</small></span></a>${readOnly ? '<span class="viewer-badge">Colleague view</span>' : `<nav aria-label="Rota management"><button class="nav-button" data-action="team">${icon('people')}<span>Colleagues</span></button><button class="nav-button" data-action="patterns">${icon('clock')}<span>Shift patterns</span></button><button class="nav-button" data-action="settings" aria-label="Settings">${icon('settings')}</button><button class="button lime" data-action="share">${icon('share')}<span>Share rota</span></button></nav>`}</header>
-  <main class="workspace"><div class="page-heading"><div><span class="eyebrow">${h(loc.name.toUpperCase())}${data.demo ? ' · EXAMPLE DATA' : ''}</span><h1>${readOnly ? 'Your team’s rota' : 'Weekly rota'}</h1></div><div class="heading-summary"><span>${icon('people')}<strong>${people.length}</strong> colleagues</span><span>${icon('clock')}<strong>${hours(total)}h</strong> scheduled</span><span class="publication ${status === 'Published' || readOnly ? 'published' : ''}">${h(status)}</span></div></div>
+  <main class="workspace"><div class="page-heading"><div><span class="eyebrow">${h(loc.name.toUpperCase())}${data.demo ? ' · EXAMPLE DATA' : ''}</span><h1>${readOnly ? 'Your team’s rota' : 'Weekly rota'}</h1></div><div class="heading-summary"><span class="colleague-summary"><span class="colleague-summary-count">${icon('people')}<strong data-summary-colleagues>${people.length}</strong> colleagues</span>${!readOnly ? `<span class="fte-summary" title="Scheduled full-time equivalents for this week and the displayed colleagues. Work and training hours, less unpaid breaks and no shows, divided by a 40-hour week."><strong data-summary-fte>${fteValue(total)}</strong> FTE · <span data-summary-fte-hours>${hours(total)}h</span><small class="fte-basis">Scheduled · 40h = 1 FTE / week</small></span>` : ''}</span><span>${icon('clock')}<strong data-summary-hours>${hours(total)}h</strong> scheduled</span><span class="publication ${status === 'Published' || readOnly ? 'published' : ''}">${h(status)}</span></div></div>
   <section class="rota-panel" aria-label="Rota planner"><div class="week-toolbar"><div class="week-controls"><button class="button icon-only" data-action="previous" aria-label="Previous week">${icon('left')}</button><div class="week-title"><strong>${shortDate(S.week)} – ${shortDate(end, { year: 'numeric' })}</strong><span>Week commencing Monday</span></div><button class="button icon-only" data-action="next" aria-label="Next week">${icon('right')}</button><button class="button this-week" data-action="today">This week</button><label class="date-jump"><span class="sr-only">Jump to a week</span><input id="week-picker" type="date" value="${S.week}" min="2020-01-01" max="2100-12-31" aria-label="Jump to a week"></label></div>${!readOnly ? `<div class="week-actions"><label class="location-picker"><span class="sr-only">Location</span><select id="location-picker">${data.locations.map(l => `<option value="${h(l.id)}" ${l.id === S.locationId ? 'selected' : ''}>${h(l.name)}${!l.active ? ' (archived)' : ''}</option>`).join('')}</select></label><button class="button primary" data-action="publish">${icon('check')}${pub ? 'Publish changes' : 'Publish week'}</button></div>` : data.weeks.length ? `<label class="published-picker"><span class="sr-only">Published weeks</span><select id="published-week"><option value="${S.week}">Choose published week</option>${data.weeks.map(w => `<option value="${w.week}">${shortDate(w.week)} – ${shortDate(plusDays(w.week, 6))}</option>`).join('')}</select></label>` : ''}</div>
-  <div class="filter-toolbar"><div class="filters"><label class="search-field">${icon('search')}<span class="sr-only">Find a colleague</span><input id="colleague-search" type="search" value="${h(S.query)}" placeholder="${readOnly ? 'Find your name…' : 'Find a colleague…'}" autocomplete="off"></label><label><span class="sr-only">Department</span><select id="team-filter"><option value="">All departments</option>${choices(departments, S.team)}</select></label><label><span class="sr-only">Warehouse</span><select id="warehouse-filter"><option value="">Both warehouses</option>${choices(warehouses, S.warehouse)}</select></label><div class="view-toggle" aria-label="Rota view"><button data-action="view-week" class="${S.view === 'week' ? 'active' : ''}" aria-pressed="${S.view === 'week'}">Week</button><button data-action="view-day" class="${S.view === 'day' ? 'active' : ''}" aria-pressed="${S.view === 'day'}">Day</button>${!readOnly ? `<button data-action="view-timeline" class="${S.view === 'timeline' ? 'active' : ''}" aria-pressed="${S.view === 'timeline'}">Timeline</button>` : ''}</div></div>${!readOnly ? `<div class="edit-actions"><button class="button danger clear-rota-button" data-action="clear-week" ${allLocationShifts().length ? '' : 'disabled'}>Clear rota</button><button class="button" data-action="copy">${icon('copy')}<span>Copy last week</span></button><button class="button dark" data-action="assign">${icon('plus')}<span>Assign shifts</span></button></div>` : '<button class="button" data-action="pdf">Download PDF</button><button class="button" data-action="print">Print rota</button>'}</div>
+  <div class="filter-toolbar"><div class="filters"><label class="search-field">${icon('search')}<span class="sr-only">Find a colleague</span><input id="colleague-search" type="search" value="${h(S.query)}" placeholder="${readOnly ? 'Find your name…' : 'Find a colleague…'}" autocomplete="off"></label><label><span class="sr-only">Department</span><select id="team-filter"><option value="">All departments</option>${choices(departments, S.team)}</select></label><label><span class="sr-only">Warehouse</span><select id="warehouse-filter"><option value="">Both warehouses</option>${choices(warehouses, S.warehouse)}</select></label><div class="view-toggle" aria-label="Rota view"><button data-action="view-week" class="${S.view === 'week' ? 'active' : ''}" aria-pressed="${S.view === 'week'}">Week</button><button data-action="view-day" class="${S.view === 'day' ? 'active' : ''}" aria-pressed="${S.view === 'day'}">Day</button>${!readOnly ? `<button data-action="view-timeline" class="${S.view === 'timeline' ? 'active' : ''}" aria-pressed="${S.view === 'timeline'}">Timeline</button>` : ''}</div></div>${!readOnly ? `<div class="edit-actions"><button class="button danger clear-rota-button" data-action="clear-week" ${allLocationShifts().length ? '' : 'disabled'}>Clear rota</button><button class="button" data-action="fill-profiles">Fill from profiles</button><button class="button" data-action="copy">${icon('copy')}<span>Copy last week</span></button><button class="button dark" data-action="assign">${icon('plus')}<span>Assign shifts</span></button></div>` : '<button class="button" data-action="pdf">Download PDF</button><button class="button" data-action="print">Print rota</button>'}</div>
   ${!readOnly && S.selected.size ? `<div class="selection-bar"><strong>${S.selected.size} colleague${S.selected.size === 1 ? '' : 's'} selected</strong><button class="button compact" data-action="assign">Assign shifts</button><button class="text-button" data-action="clear-selection">Clear selection</button></div>` : ''}
   ${readOnly && data.unpublished ? `<div class="empty-state"><span class="empty-icon">${icon('calendar')}</span><h2>This week hasn’t been published yet</h2><p>Select a published week above or check again later.</p></div>` : `<div id="rota-content">${rotaContent()}</div>`}
   <footer class="panel-footer"><div class="legend"><span><i class="legend-picking"></i>Picking</span><span><i class="legend-engraving"></i>Engraving</span><span><i class="legend-packing"></i>Packing</span><span><i class="legend-holiday"></i>Holiday</span>${!readOnly ? '<span><i class="legend-sick"></i>Sick</span>' : ''}<span><i class="legend-unavailable"></i>Unavailable</span></div><span>${readOnly && data.published_at ? `Updated ${h(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(data.published_at)))}` : !readOnly ? 'Private draft edits appear to colleagues after publishing.' : ''}</span></footer></section><div class="workspace-footer"><span>WH1 = Warehouse 1 · WH2 = Warehouse 2. UK local time. Breaks are unpaid. +1 means next-day finish.</span>${!readOnly ? `<div><a class="text-button" href="/api/export.csv?locationId=${encodeURIComponent(S.locationId)}&week=${S.week}">Export CSV</a><button class="text-button" data-action="pdf">Share PDF</button><button class="text-button" data-action="print">Print</button><button class="text-button" data-action="logout">Sign out</button></div>` : '<a class="text-button" href="/">Manager sign in</a>'}</div></main>`;
   $('colleague-search').oninput = event => {
     S.query = event.target.value;
     if (S.view === 'timeline') { const position = event.target.selectionStart; render(); $('colleague-search').focus(); $('colleague-search').setSelectionRange(position, position); }
-    else { const content = $('rota-content'); if (content) content.innerHTML = rotaContent(); }
+    else { const content = $('rota-content'); if (content) content.innerHTML = rotaContent(); updateHeadingSummary(); }
   };
   $('team-filter').onchange = event => { S.team = event.target.value; S.selected.clear(); render(); };
   if ($('coverage-start')) $('coverage-start').onchange = event => { if (event.target.value) S.coverageStart = event.target.value; render(); };
@@ -339,16 +490,19 @@ function patternOptions(selected = '') {
 }
 function fieldsHTML(shift = {}, assignmentFields = '') {
   const assigning = Boolean(assignmentFields);
-  const nameField = `<label>${assigning ? 'Shift name (optional)' : 'Pattern name'}<input id="shift-label" maxlength="60" value="${h(shift.label || 'Shift')}" ${assigning ? '' : 'required'}></label>`;
-  return `<div class="field-row"><label>Type<select id="shift-kind">${Object.entries(kindNames).map(([k, v]) => `<option value="${k}" ${(shift.kind || 'work') === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>${assigning ? `<label>Pattern<select id="shift-pattern">${patternOptions()}</select></label>` : nameField}</div>${assignmentFields}<div id="working-fields"><div class="field-row"><label>Start<input id="shift-start" type="time" value="${h(shift.start_time || '')}" required></label><label>Finish<input id="shift-end" type="time" value="${h(shift.end_time || '')}" required></label></div><div class="field-row"><label>Break starts<input id="shift-break-start" type="time" value="${h(shift.break_start || '')}"></label><label>Unpaid break (mins)<input id="shift-break" type="number" min="0" max="240" step="1" value="${shift.break_minutes || 0}" required></label></div><p class="field-help" id="shift-duration">Choose times or select a pattern.</p></div><p class="field-help" id="sick-help" hidden>Sick is shown as Unavailable on the shared rota and PDFs.</p><details class="shift-more"><summary>More details</summary>${assigning ? nameField : ''}<label>Colour<select id="shift-colour">${['blue', 'teal', 'violet', 'amber'].map(c => `<option value="${c}" ${(shift.colour || 'blue') === c ? 'selected' : ''}>${c[0].toUpperCase() + c.slice(1)}</option>`).join('')}</select></label><label>Manager note <span class="optional">private</span><textarea id="shift-note" rows="2" maxlength="500">${h(shift.note || '')}</textarea></label></details>`;
+  const nameField = `<label>Pattern name<input id="shift-label" maxlength="60" value="${h(shift.label || 'Shift')}" required></label>`;
+  const labels = [...new Set(['B2B', ...S.data.shifts.map(shiftLabel).filter(Boolean)])];
+  const labelEditor = `<div class="shift-label-editor"><label for="shift-label">Shift label <span class="optional">optional</span></label><div class="shift-label-control"><input id="shift-label" maxlength="60" value="${h(shiftLabel(shift))}" placeholder="B2B or a manual label" list="shift-label-suggestions" autocomplete="off" title="Shown beside the shift time. Clear this field to remove the label."><button type="button" class="button compact" id="shift-label-b2b" aria-label="Use B2B label">B2B</button></div><datalist id="shift-label-suggestions">${labels.map(label => `<option value="${h(label)}"></option>`).join('')}</datalist></div>`;
+  return `<div class="field-row"><label>Type<select id="shift-kind">${Object.entries(kindNames).map(([k, v]) => `<option value="${k}" ${(shift.kind || 'work') === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>${assigning ? `<label>Pattern<select id="shift-pattern">${patternOptions()}</select></label>` : nameField}</div>${assignmentFields}<div id="working-fields"><div class="field-row"><label>Start<input id="shift-start" type="time" value="${h(shift.start_time || '')}" required></label><label>Finish<input id="shift-end" type="time" value="${h(shift.end_time || '')}" required></label></div><div class="field-row"><label>Break starts<input id="shift-break-start" type="time" value="${h(shift.break_start || '')}"></label><label>Unpaid break (mins)<input id="shift-break" type="number" min="0" max="240" step="1" value="${shift.break_minutes || 0}" required></label></div><p class="field-help" id="shift-duration">Choose times or select a pattern.</p></div><div id="holiday-fields" hidden><label>Holiday hours to deduct <span class="optional">leave blank for the usual working day</span><input id="shift-holiday-hours" type="number" min="0.01" max="24" step="any" value="${shift.holiday_minutes == null ? '' : Number((shift.holiday_minutes / 60).toFixed(8))}" placeholder="e.g. 7.5"></label><label class="check-label"><input id="shift-holiday-approved" type="checkbox" ${shift.holiday_approved !== 0 && shift.holiday_approved !== false ? 'checked' : ''}>Approved holiday</label><p class="field-help">Approved entries count towards the colleague’s holiday balance. Pending entries do not. Hours affect the leave balance; the rota entry remains an absence for the whole day.</p></div>${assigning ? labelEditor : ''}<p class="field-help" id="sick-help" hidden>Sick is shown as Unavailable on the shared rota and PDFs.</p><details class="shift-more"><summary>More details</summary><label>Colour<select id="shift-colour">${['blue', 'teal', 'violet', 'amber'].map(c => `<option value="${c}" ${(shift.colour || 'blue') === c ? 'selected' : ''}>${c[0].toUpperCase() + c.slice(1)}</option>`).join('')}</select></label><label>Manager note <span class="optional">private</span><textarea id="shift-note" rows="2" maxlength="500">${h(shift.note || '')}</textarea></label></details>`;
 }
 function readShiftFields() {
-  return { kind: $('shift-kind').value, label: $('shift-label').value, start_time: $('shift-start').value, end_time: $('shift-end').value, break_minutes: Number($('shift-break').value), break_start: $('shift-break-start').value || null, colour: $('shift-colour').value, note: $('shift-note').value, ...($('shift-department') ? { department: $('shift-department').value || ($('shift-person') ? '' : undefined), warehouse: $('shift-warehouse').value } : {}) };
+  return { kind: $('shift-kind').value, label: $('shift-label').value, start_time: $('shift-start').value, end_time: $('shift-end').value, break_minutes: Number($('shift-break').value), break_start: $('shift-break-start').value || null, colour: $('shift-colour').value, note: $('shift-note').value, ...($('shift-kind').value === 'holiday' ? { holiday_hours: $('shift-holiday-hours').value, holiday_approved: $('shift-holiday-approved').checked } : {}), ...($('shift-packing-position') ? { packing_station_id: $('shift-packing-position').value.split(':')[0] || null, packing_position: $('shift-packing-position').value.split(':')[1] || '' } : {}), ...($('shift-department') ? { department: $('shift-department').value || ($('shift-person') ? '' : undefined), warehouse: $('shift-warehouse').value } : {}) };
 }
 function wireShiftFields() {
   function update() {
     const working = ['work', 'training'].includes($('shift-kind').value);
     $('working-fields').hidden = !working;
+    $('holiday-fields').hidden = $('shift-kind').value !== 'holiday';
     $('sick-help').hidden = $('shift-kind').value !== 'sick';
     if ($('shift-pattern')) $('shift-pattern').disabled = !working;
     $('shift-break-start').disabled = !working || Number($('shift-break').value) === 0;
@@ -368,10 +522,13 @@ function wireShiftFields() {
   }
   $('shift-kind').onchange = () => {
     const kind = $('shift-kind').value;
-    if (['holiday', 'sick', 'unavailable'].includes(kind)) $('shift-label').value = kindNames[kind];
+    if ($('shift-label-b2b')) {
+      if (['Shift', 'Holiday', 'Sick', 'Unavailable'].includes($('shift-label').value)) $('shift-label').value = '';
+    } else if (['holiday', 'sick', 'unavailable'].includes(kind)) $('shift-label').value = kindNames[kind];
     else if (['Holiday', 'Sick', 'Unavailable'].includes($('shift-label').value)) $('shift-label').value = 'Shift';
     update();
   };
+  if ($('shift-label-b2b')) $('shift-label-b2b').onclick = () => { $('shift-label').value = 'B2B'; $('shift-label').focus(); };
   for (const id of ['shift-start', 'shift-end', 'shift-break', 'shift-break-start']) $(id).oninput = update;
   if ($('shift-pattern')) $('shift-pattern').onchange = event => {
     const template = S.data.templates.find(t => t.id === event.target.value);
@@ -384,6 +541,63 @@ function wireShiftFields() {
   };
   update();
 }
+function wireShiftWeekSummary({ single, shift }) {
+  const form = $('dialog-form'), panel = $('shift-week-summary');
+  const weeks = new Map([[S.data.week, Promise.resolve(S.data)]]);
+  let sequence = 0, expanded = single;
+  const current = request => request === sequence && form.isConnected && $('modal').open;
+  const status = (message, error = false) => {
+    panel.setAttribute('aria-busy', 'false');
+    panel.innerHTML = `<h3>Shifts this week</h3><p class="field-help ${error ? 'form-error' : ''}">${h(message)}</p>${error ? '<button type="button" class="text-button" data-week-preview-refresh>Try again</button>' : ''}`;
+  };
+  const refresh = async (force = false) => {
+    const request = ++sequence;
+    const selected = single ? [$('shift-person').value] : [...form.querySelectorAll('[name="person_ids"]:checked')].map(input => input.value);
+    if (selected.length !== 1) { status('Select one colleague to see their saved shifts this week.'); return; }
+    const personId = selected[0], p = S.data.people.find(person => person.id === personId);
+    const date = single ? $('shift-date').value : form.querySelector('[name="dates"]:checked')?.value || S.week;
+    const parsed = new Date(`${date}T12:00:00Z`);
+    if (!p || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date || date < '2020-01-01' || date > '2100-12-31') {
+      status('Choose a valid date to see that week’s saved shifts.'); return;
+    }
+    const week = monday(date);
+    if (force) weeks.delete(week);
+    if (!weeks.has(week)) {
+      const reading = api(`/api/state?week=${encodeURIComponent(date)}`);
+      weeks.set(week, reading);
+      reading.catch(() => { if (weeks.get(week) === reading) weeks.delete(week); });
+    }
+    panel.setAttribute('aria-busy', 'true');
+    panel.innerHTML = '<h3>Shifts this week</h3><p class="field-help">Reading saved shifts…</p>';
+    try {
+      const data = await weeks.get(week);
+      if (!current(request)) return;
+      if (data.week !== week) throw new Error('A different week was returned. Try refreshing the summary.');
+      const entries = data.shifts.filter(entry => entry.person_id === personId && entry.date >= week && entry.date <= plusDays(week, 6))
+        .sort((a, b) => a.date.localeCompare(b.date) || (a.start_time || '').localeCompare(b.start_time || '') || a.id.localeCompare(b.id));
+      const noShow = entry => ['work', 'training'].includes(entry.kind) && (data.attendance || []).some(record => record.person_id === personId && record.location_id === entry.location_id && record.date === entry.date && record.status === 'no_show');
+      const total = entries.reduce((sum, entry) => sum + (noShow(entry) ? 0 : minutes(entry)), 0);
+      const daysHTML = days.map((name, index) => {
+        const day = plusDays(week, index), assignments = entries.filter(entry => entry.date === day);
+        return `<li class="shift-week-day ${day === date ? 'selected-day' : ''}" data-week-preview-date="${day}"><div class="shift-week-date"><strong>${name}</strong><span>${shortDate(day, { month: undefined })}</span></div><div class="shift-week-entries">${assignments.map(entry => {
+          const working = ['work', 'training'].includes(entry.kind), site = (data.locations || S.data.locations).find(location => location.id === entry.location_id);
+          const assignment = [entry.department, packingPositionLabel(entry, data.packingStations), entry.warehouse === 'Warehouse 1' ? 'WH1' : entry.warehouse === 'Warehouse 2' ? 'WH2' : entry.warehouse, entry.location_id !== S.locationId ? site?.name || 'Other location' : ''].filter(Boolean).join(' · ');
+          const label = shiftLabel(entry), absent = noShow(entry);
+          return `<div class="shift-week-entry ${working ? departmentColour[entry.department] || 'blue' : h(entry.kind)} ${entry.id === shift?.id ? 'editing-shift' : ''}" data-week-preview-shift="${h(entry.id)}"><div class="shift-week-entry-title"><strong>${working ? `${h(entry.start_time)}–${h(entry.end_time)}${entry.end_time < entry.start_time ? ' +1' : ''}` : h(kindNames[entry.kind] || entry.kind)}</strong>${entry.kind === 'training' ? '<span>Training</span>' : ''}${entry.id === shift?.id ? '<span class="shift-week-editing">Editing</span>' : ''}${absent ? '<span class="shift-week-no-show">No show</span>' : ''}</div>${assignment ? `<span class="shift-week-assignment">${h(assignment)}</span>` : ''}${label ? `<span class="shift-week-label">${h(label)}</span>` : ''}</div>`;
+        }).join('') || '<span class="shift-week-off">No shift</span>'}</div></li>`;
+      }).join('');
+      panel.setAttribute('aria-busy', 'false');
+      panel.innerHTML = `<details class="shift-week-details" ${expanded ? 'open' : ''}><summary><span><strong>Shifts this week</strong><small>${h(p.name)} · ${shortDate(week)}–${shortDate(plusDays(week, 6), { year: 'numeric' })}</small></span><strong class="shift-week-total">${hours(total)}h<small>saved</small></strong></summary><ol class="shift-week-days">${daysHTML}</ol><p class="shift-week-footnote">All locations · After breaks${entries.some(noShow) ? ' · No shows excluded' : ''}. Unsaved changes are not included.</p><button type="button" class="text-button" data-week-preview-refresh>Refresh summary</button></details>`;
+      panel.querySelector('details').ontoggle = event => { expanded = event.currentTarget.open; };
+    } catch (error) { if (current(request)) status(`Could not read this week’s shifts. ${error.message} Your shift details are unchanged.`, true); }
+  };
+  const changed = event => {
+    if (['shift-person', 'shift-date', 'bulk-all'].includes(event.target.id) || ['person_ids', 'dates'].includes(event.target.name)) refresh();
+  };
+  form.addEventListener('input', changed); form.addEventListener('change', changed);
+  panel.onclick = event => { if (event.target.closest('[data-week-preview-refresh]')) refresh(true); };
+  refresh();
+}
 function openAssign({ personIds = [...S.selected], dates = [], shift = null } = {}) {
   if (readOnly) return;
   const single = Boolean(shift) || (personIds.length === 1 && dates.length === 1);
@@ -392,11 +606,14 @@ function openAssign({ personIds = [...S.selected], dates = [], shift = null } = 
   if (shift) { personIds = [shift.person_id]; dates = [shift.date]; }
   const body = single ? `<div class="field-row"><label>Colleague<select id="shift-person">${people.map(p => `<option value="${h(p.id)}" ${personIds.includes(p.id) ? 'selected' : ''}>${h(p.name)}</option>`).join('')}</select></label><label>Date<input type="date" id="shift-date" value="${dates[0]}" required min="2020-01-01" max="2100-12-31"></label></div>` : `<div class="assign-layout"><section><div class="section-label"><strong>Colleagues</strong><label class="check-label"><input id="bulk-all" type="checkbox">Select all</label></div><input id="bulk-search" type="search" placeholder="Find a colleague…" aria-label="Find colleagues to assign"><div class="people-checklist">${people.map(p => `<label class="person-check" data-name="${h(p.name.toLocaleLowerCase())}"><input type="checkbox" name="person_ids" value="${h(p.id)}" ${personIds.includes(p.id) ? 'checked' : ''}><span><strong>${h(p.name)}</strong><small>${h(departmentName(p))}</small></span></label>`).join('')}</div><p class="field-help" id="bulk-count"></p></section><section><strong class="section-label">Days this week</strong><div class="days-checklist">${days.map((d, i) => { const date = plusDays(S.week, i); return `<label class="check-label"><input type="checkbox" name="dates" value="${date}" ${dates.length ? dates.includes(date) ? 'checked' : '' : i < 5 ? 'checked' : ''}><span>${d}</span><small>${shortDate(date)}</small></label>`; }).join('')}</div></section></div>`;
   const department = shift?.department ?? (single ? defaultDepartment(people.find(p => p.id === personIds[0])) : '');
-  const assignmentFields = `<div id="assignment-fields"><div class="field-row"><label>Department<select id="shift-department"><option value="">${single ? 'Choose department' : 'Use each colleague’s default'}</option>${choices(departments, department)}</select></label><label>Warehouse<select id="shift-warehouse"><option value="">Choose warehouse</option>${choices(warehouses, shift?.warehouse ?? S.warehouse)}</select></label></div></div>`;
-  modal(shift ? 'Edit shift' : single ? 'Add shift' : 'Assign shifts', `${body}${fieldsHTML(shift || {}, assignmentFields)}`, `${shift ? '<button type="button" class="button danger" id="remove-shift">Remove shift</button><span class="footer-spacer"></span>' : ''}${cancel}<button class="button primary" type="submit">${shift ? 'Save changes' : 'Assign shifts'}</button>`, !single);
+  const assignmentFields = `<div id="assignment-fields"><div class="field-row"><label>Department<select id="shift-department"><option value="">${single ? 'Choose department' : 'Use each colleague’s default'}</option>${choices(departments, department)}</select></label><label>Warehouse<select id="shift-warehouse"><option value="">Choose warehouse</option>${choices(warehouses, shift?.warehouse ?? (S.warehouse || (single ? people.find(p => p.id === personIds[0])?.default_warehouse : '')))}</select></label></div></div>`;
+  const weekPanel = '<section id="shift-week-summary" class="shift-week-summary" aria-label="Colleague’s saved shifts for the selected week" aria-live="polite"></section>';
+  const fields = `${fieldsHTML(shift || {}, assignmentFields)}${single ? '<div id="shift-packing-field"><label>Packing position <span class="optional">optional</span><select id="shift-packing-position"></select></label><p class="field-help">A and B share a station. You can also assign positions in Day view.</p></div>' : ''}<div id="shift-availability-warning" class="availability-warning" role="status" aria-live="polite" hidden></div>`;
+  modal(shift ? 'Edit shift' : single ? 'Add shift' : 'Assign shifts', `${body}${single ? `<div class="shift-context-layout"><div class="shift-context-fields">${fields}</div><aside class="shift-context-aside">${weekPanel}</aside></div>` : `${weekPanel}${fields}`}`, `${shift ? '<button type="button" class="button danger" id="remove-shift">Remove shift</button><span class="footer-spacer"></span>' : ''}${cancel}<button class="button primary" type="submit">${shift ? 'Save changes' : 'Assign shifts'}</button>`, !single);
   $('modal').classList.add('shift-dialog');
+  if (single) $('modal').classList.add('shift-context-dialog');
   wireShiftFields();
-  if (single) $('shift-person').onchange = event => { $('shift-department').value = defaultDepartment(people.find(p => p.id === event.target.value)); };
+  if (single) $('shift-person').onchange = event => { const person = people.find(p => p.id === event.target.value); $('shift-department').value = defaultDepartment(person); if (person.default_warehouse) $('shift-warehouse').value = person.default_warehouse; };
   if (!single) {
     const updateCount = () => {
       const count = $('dialog-form').querySelectorAll('[name="person_ids"]:checked').length;
@@ -413,14 +630,42 @@ function openAssign({ personIds = [...S.selected], dates = [], shift = null } = 
     event.preventDefault(); const form = event.currentTarget;
     formAction(form, async () => {
       let result;
-      if (single) result = await mutate(shift ? `/api/shifts/${shift.id}` : '/api/shifts', { ...readShiftFields(), person_id: $('shift-person').value, date: $('shift-date').value, location_id: S.locationId }, shift ? 'PUT' : 'POST');
-      else result = await mutate('/api/shifts/bulk', { ...readShiftFields(), person_ids: [...form.querySelectorAll('[name="person_ids"]:checked')].map(c => c.value), dates: [...form.querySelectorAll('[name="dates"]:checked')].map(c => c.value), location_id: S.locationId });
+      if (single) result = await saveWithAvailability(shift ? `/api/shifts/${shift.id}` : '/api/shifts', { ...readShiftFields(), person_id: $('shift-person').value, date: $('shift-date').value, location_id: S.locationId }, shift ? 'PUT' : 'POST');
+      else result = await saveWithAvailability('/api/shifts/bulk', { ...readShiftFields(), person_ids: [...form.querySelectorAll('[name="person_ids"]:checked')].map(c => c.value), dates: [...form.querySelectorAll('[name="dates"]:checked')].map(c => c.value), location_id: S.locationId });
+      if (!result) return;
       closeDialog(); S.selected.clear(); render(); toast(single ? 'Shift saved. Publish the week when ready.' : `${result.created} shifts assigned. Publish the week when ready.`);
     });
   };
+  const refreshAvailability = () => {
+    const warning = $('shift-availability-warning'), fields = readShiftFields();
+    const selected = single ? [$('shift-person').value] : [...$('dialog-form').querySelectorAll('[name="person_ids"]:checked')].map(input => input.value);
+    const chosenDates = single ? [$('shift-date').value] : [...$('dialog-form').querySelectorAll('[name="dates"]:checked')].map(input => input.value);
+    const conflicts = selected.flatMap(id => chosenDates.map(date => date ? availabilityWarning(S.data.people.find(p => p.id === id), { ...fields, date }) : '')).filter(Boolean);
+    warning.hidden = !conflicts.length;
+    warning.innerHTML = conflicts.length ? `<strong>Outside availability</strong>${conflicts.slice(0, 4).map(text => `<p>${h(text)}</p>`).join('')}${conflicts.length > 4 ? `<p>Plus ${conflicts.length - 4} other conflicts.</p>` : ''}<p>You can review the times or choose to schedule anyway when saving.</p>` : '';
+  };
+  $('dialog-form').addEventListener('input', refreshAvailability);
+  $('dialog-form').addEventListener('change', refreshAvailability);
+  refreshAvailability();
   if ($('remove-shift')) $('remove-shift').onclick = () => {
     if (confirm('Remove this shift from the draft rota?')) formAction($('dialog-form'), async () => { await mutate(`/api/shifts/${shift.id}`, {}, 'DELETE'); closeDialog(); toast('Shift removed from the draft rota.'); });
   };
+  if (single) wirePackingField(shift);
+  wireShiftWeekSummary({ single, shift });
+}
+function wirePackingField(shift) {
+  const field = $('shift-packing-field'), select = $('shift-packing-position');
+  let first = true;
+  const update = () => {
+    const selected = first && shift?.packing_station_id ? `${shift.packing_station_id}:${shift.packing_position}` : select.value;
+    first = false;
+    field.hidden = $('shift-department').value !== 'Packing' || !['work', 'training'].includes($('shift-kind').value);
+    const stations = (S.data.packingStations || []).filter(s => s.location_id === S.locationId && s.warehouse === $('shift-warehouse').value && (s.active || s.id === shift?.packing_station_id));
+    select.innerHTML = '<option value="">Unassigned</option>' + stations.flatMap(s => ['A', 'B'].map(position => `<option value="${h(s.id)}:${position}">${s.number}${position}${s.active ? '' : ' · Archived'}</option>`)).join('');
+    if (!field.hidden && [...select.options].some(option => option.value === selected)) select.value = selected;
+  };
+  $('dialog-form').addEventListener('change', event => { if (['shift-department', 'shift-warehouse', 'shift-kind', 'shift-pattern', 'shift-person'].includes(event.target.id)) update(); });
+  update();
 }
 function openTeam() {
   const people = S.data.people.filter(p => p.location_id === S.locationId);
@@ -476,10 +721,11 @@ function openProfile(id) {
   const shifts = allLocationShifts().filter(s => s.person_id === id);
   const previous = shifts.filter(finishedShift).sort((a, b) => b.date.localeCompare(a.date) || b.end_time.localeCompare(a.end_time));
   const selectedDate = previous[0]?.date || londonToday();
-  modal(p.name, `<div class="profile-summary"><span class="department-tag ${departmentColour[defaultDepartment(p)] || 'blue'}">${h(departmentName(p))}</span>${p.is_example ? '<span class="example-tag">Example colleague</span>' : ''}<p>${h(p.role || 'Warehouse colleague')} · ${hours(shifts.reduce((sum, shift) => sum + minutes(shift), 0))}h scheduled in this rota week</p></div><h3>Performance for this rota week</h3><p class="profile-week-range">${h(shortDate(profileWeek))} – ${h(shortDate(plusDays(profileWeek, 6)))} · ${h(currentLocation().name)}</p><div id="profile-week-performance" aria-live="polite"><p class="field-help">Reading this week’s recorded performance…</p></div><details class="profile-day-details" id="profile-day-details"><summary>Review one date</summary><label class="profile-date-control">Performance date<input id="profile-performance-date" type="date" min="2020-01-01" max="${londonToday()}" value="${selectedDate}"></label><div id="profile-performance" aria-live="polite"></div></details><h3>Shifts in this rota week</h3><div class="profile-shifts">${shifts.map(s => `<div><strong>${shortDate(s.date, { weekday: 'short' })}</strong>${shiftCard(s)}${finishedShift(s) ? `<button class="text-button profile-performance-button" type="button" data-performance-date="${s.date}">View day details</button>` : ''}</div>`).join('') || '<p class="field-help">No shifts assigned in this rota week. Use “Review one date” to view earlier performance.</p>'}</div>`, '<button type="button" class="button danger" id="delete-profile">Delete colleague</button><span class="footer-spacer"></span><button type="button" class="button" data-action="close-modal">Done</button><button type="button" class="button primary" id="edit-profile">Edit colleague</button>', true);
-  $('modal').dataset.profileId = id; $('edit-profile').onclick = () => editPerson(id); $('delete-profile').onclick = () => deletePerson(id);
+  modal(p.name, `<div class="profile-summary"><span class="department-tag ${departmentColour[defaultDepartment(p)] || 'blue'}">${h(departmentName(p))}</span>${p.is_example ? '<span class="example-tag">Example colleague</span>' : ''}<p>${h(p.role || 'Warehouse colleague')} · ${hours(shifts.reduce((sum, shift) => sum + rotaMinutes(shift), 0))}h scheduled in this rota week</p></div>${profileAvailabilityHTML(p)}<section class="profile-holiday" id="profile-holiday" aria-live="polite"><h3>Holiday tracker</h3><p class="field-help">Reading holiday allowance and bookings…</p></section><h3>Performance for this rota week</h3><p class="profile-week-range">${h(shortDate(profileWeek))} – ${h(shortDate(plusDays(profileWeek, 6)))} · ${h(currentLocation().name)}</p><div id="profile-week-performance" aria-live="polite"><p class="field-help">Reading this week’s recorded performance…</p></div><details class="profile-day-details" id="profile-day-details"><summary>Review one date</summary><label class="profile-date-control">Performance date<input id="profile-performance-date" type="date" min="2020-01-01" max="${londonToday()}" value="${selectedDate}"></label><div id="profile-performance" aria-live="polite"></div></details><h3>Shifts in this rota week</h3><div class="profile-shifts">${shifts.map(s => `<div><strong>${shortDate(s.date, { weekday: 'short' })}</strong>${shiftCard(s, true)}${finishedShift(s) ? `<button class="text-button profile-performance-button" type="button" data-performance-date="${s.date}">View day details</button>` : ''}</div>`).join('') || '<p class="field-help">No shifts assigned in this rota week. Use “Review one date” to view earlier performance.</p>'}</div>`, '<button type="button" class="button danger" id="delete-profile">Delete colleague</button><span class="footer-spacer"></span><button type="button" class="button" data-action="close-modal">Done</button><button type="button" class="button primary" id="edit-profile">Edit colleague</button>', true);
+  $('modal').dataset.profileId = id; $('profile-edit-availability').onclick = () => editAvailability(id); $('edit-profile').onclick = () => editPerson(id); $('delete-profile').onclick = () => deletePerson(id);
   $('dialog-form').onsubmit = event => event.preventDefault();
   const current = () => $('modal').open && $('modal').dataset.profileId === id && profileSession === profileSequence;
+  loadProfileHoliday(id, current);
   const connectionPrompt = () => '<p class="field-help">Connect your warehouse dashboard to view this colleague’s recorded Picking and Packing performance.</p><button type="button" class="button" data-profile-connect>Connect dashboard</button>';
   (async () => {
     try {
@@ -511,6 +757,47 @@ function openProfile(id) {
   $('profile-performance-date').onchange = event => { if (event.target.value && event.target.reportValidity()) load(event.target.value); };
   for (const button of $('modal').querySelectorAll('[data-performance-date]')) button.onclick = () => { $('profile-performance-date').value = button.dataset.performanceDate; dailyLoaded = true; $('profile-day-details').open = true; load(button.dataset.performanceDate); $('profile-day-details').scrollIntoView({ block: 'nearest' }); };
 }
+async function loadProfileHoliday(id, current, yearStart = '') {
+  const region = $('profile-holiday');
+  if (!region) return;
+  const request = String(Number(region.dataset.request || 0) + 1); region.dataset.request = request;
+  const date = S.week === monday(londonToday()) ? londonToday() : S.week;
+  try {
+    const data = await api(`/api/people/${encodeURIComponent(id)}/holiday?${new URLSearchParams({ date, ...(yearStart ? { yearStart } : {}) })}`);
+    if (!current() || !region.isConnected || region.dataset.request !== request) return;
+    if (data.revision !== S.data.revision) await load();
+    if (!current() || !region.isConnected || region.dataset.request !== request) return;
+    const a = data.account;
+    const leaveValue = value => `<strong>${hours(value)}<small>h</small></strong><small>${Number((value / a.day_minutes).toFixed(2)).toLocaleString('en-GB')} days</small>`;
+    const yearPicker = data.accounts.length ? `<label class="holiday-year-picker">Holiday year<select id="holiday-year"><option value="" ${!a ? 'selected' : ''}>Year for displayed week${!a ? ' · not set' : ''}</option>${data.accounts.map(account => `<option value="${account.year_start}" ${a?.year_start === account.year_start ? 'selected' : ''}>${shortDate(account.year_start, { year: 'numeric' })} – ${shortDate(account.year_end, { year: 'numeric' })}</option>`).join('')}</select></label>` : '';
+    region.innerHTML = `<div class="availability-heading"><h3>Holiday tracker</h3><button type="button" class="button compact" id="holiday-settings">${a ? 'Edit allowance' : 'Set allowance'}</button></div>${yearPicker}${a ? `<div class="holiday-totals"><div><span>Allowance + carry-over</span>${leaveValue(data.total_minutes)}</div><div><span>Taken to date</span>${leaveValue(data.taken_minutes)}</div><div><span>Approved upcoming</span>${leaveValue(data.booked_minutes)}</div><div class="${data.remaining_minutes < 0 ? 'overdrawn' : ''}"><span>Remaining to book</span>${leaveValue(data.remaining_minutes)}</div></div><p class="field-help">As of ${shortDate(data.as_of, { year: 'numeric' })}. One equivalent day = ${hours(a.day_minutes)} paid hours. Taken includes ${hours(a.opening_taken_minutes)}h entered as the opening balance; rota entries from ${shortDate(a.tracking_start, { year: 'numeric' })} are added. ${data.pending_minutes ? `${hours(data.pending_minutes)}h pending approval is not deducted.` : ''} All locations are included.</p>${data.remaining_minutes < 0 ? '<p class="coverage-alert">Approved holiday exceeds the entered allowance. Review the figures and bookings.</p>' : ''}` : '<p class="field-help">Set this colleague’s allowance and usual working day to calculate taken, upcoming and remaining holiday. No entitlement is assumed.</p>'}<details class="holiday-bookings"><summary>${data.bookings.length} holiday entries${a ? ' in this leave year' : ` in ${date.slice(0, 4)}`}</summary><div class="holiday-booking-list">${data.bookings.map(s => `<div><strong>${shortDate(s.date, { weekday: 'short', year: 'numeric' })}</strong><span>${s.leave_minutes != null ? `${hours(s.leave_minutes)}h` : s.holiday_minutes != null ? `${hours(s.holiday_minutes)}h` : 'Usual working day'} · ${s.holiday_approved === 0 ? 'Pending' : 'Approved'}${s.included === false ? ' · covered by opening balance' : ''}</span><small>${h(s.location_name)}${shiftLabel(s) ? ` · ${h(shiftLabel(s))}` : ''}</small>${s.location_id === S.locationId ? `<button type="button" class="text-button" data-edit-holiday="${h(s.id)}">Edit entry</button>` : ''}</div>`).join('') || '<p class="field-help">No holiday entries for this period.</p>'}</div></details>${data.accounts.length ? '<button type="button" class="text-button" id="holiday-new-year">Add another holiday year</button>' : ''}`;
+    $('holiday-settings').onclick = () => editHolidayAccount(id, a, data.revision, date);
+    if ($('holiday-new-year')) $('holiday-new-year').onclick = () => editHolidayAccount(id, null, data.revision, plusDays(data.accounts[0].year_end, 1), true);
+    if ($('holiday-year')) $('holiday-year').onchange = event => loadProfileHoliday(id, current, event.target.value);
+    for (const button of region.querySelectorAll('[data-edit-holiday]')) button.onclick = () => openAssign({ shift: data.bookings.find(s => s.id === button.dataset.editHoliday) });
+  } catch (error) { if (current() && region.isConnected && region.dataset.request === request) { region.innerHTML = `<h3>Holiday tracker</h3><p class="form-error">${h(error.message)}</p><button type="button" class="button compact" id="holiday-retry">Try again</button>`; $('holiday-retry').onclick = () => loadProfileHoliday(id, current, yearStart); } }
+}
+function editHolidayAccount(id, account, reviewedRevision, date, exactStart = false) {
+  const existing = Boolean(account), year = date.slice(0, 4);
+  const start = account?.year_start || (exactStart ? date : `${year}-01-01`);
+  const nextYear = new Date(`${start}T12:00:00Z`); nextYear.setUTCFullYear(nextYear.getUTCFullYear() + 1);
+  const end = account?.year_end || plusDays(nextYear.toISOString().slice(0, 10), -1);
+  const daysValue = minutes => account ? Number((minutes / account.day_minutes).toFixed(8)) : 0;
+  modal(existing ? 'Edit holiday allowance' : 'Set holiday allowance', `<p>Enter the agreed allowance for ${h(S.data.people.find(p => p.id === id)?.name)}. Figures entered in days are converted using their usual paid working day.</p><div class="field-row"><label>Holiday year starts<input id="holiday-year-start" type="date" min="2020-01-01" max="2100-12-31" value="${start}" required></label><label>Holiday year ends<input id="holiday-year-end" type="date" min="2020-01-01" max="2100-12-31" value="${end}" required></label></div><label>Paid hours in a usual day<input id="holiday-day-hours" type="number" min="0.01" max="24" step="any" value="${account ? Number((account.day_minutes / 60).toFixed(8)) : ''}" placeholder="e.g. 7.5" required></label><div class="field-row"><label>Annual allowance (days)<input id="holiday-allowance-days" type="number" min="0" max="1000" step="any" value="${account ? daysValue(account.allowance_minutes) : ''}" required></label><label>Carry-over (days)<input id="holiday-carry-days" type="number" min="0" max="1000" step="any" value="${daysValue(account?.carry_minutes)}" required></label></div><details class="holiday-opening" ${account?.opening_taken_minutes ? 'open' : ''}><summary>Opening balance / existing leave records</summary><label>Already taken before tracking starts (days)<input id="holiday-opening-days" type="number" min="0" max="1000" step="any" value="${daysValue(account?.opening_taken_minutes)}" required></label><label>Count rota holiday entries from<input id="holiday-tracking-start" type="date" min="${start}" max="${end}" value="${account?.tracking_start || start}" required></label><p class="field-help">For a fresh year, enter 0 and count from the year’s start. If importing a balance, enter days already taken and start counting after the period covered by that balance. Earlier rota entries are excluded so leave is not counted twice.</p></details><p id="holiday-allowance-preview" class="field-help"></p><p class="field-help">Approved past entries count as taken; approved future entries reduce what remains to book. Removing a holiday entry or changing it to pending restores its hours. Changing the usual working day also changes deductions for holiday entries whose hours are blank.</p>`, `<button type="button" class="button" id="holiday-back">Back to profile</button><button type="submit" class="button primary">Save allowance</button>`, true);
+  $('holiday-back').onclick = () => openProfile(id);
+  const preview = () => {
+    const day = Number($('holiday-day-hours').value), allowance = Number($('holiday-allowance-days').value), carry = Number($('holiday-carry-days').value);
+    $('holiday-allowance-preview').textContent = day > 0 ? `${hours(Math.round((allowance + carry) * day * 60))}h total allowance including carry-over.` : 'Enter the paid hours in one usual day.';
+    $('holiday-tracking-start').min = $('holiday-year-start').value; $('holiday-tracking-start').max = $('holiday-year-end').value;
+  };
+  $('dialog-form').addEventListener('input', preview); preview();
+  $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => {
+    if (reviewedRevision !== S.data.revision) throw new Error('The rota changed. Go back to the profile and review the holiday figures before saving.');
+    const day = Number($('holiday-day-hours').value);
+    await mutate(`/api/people/${id}/holiday`, { ...(account ? { original_year_start: account.year_start } : {}), year_start: $('holiday-year-start').value, year_end: $('holiday-year-end').value, tracking_start: $('holiday-tracking-start').value, day_hours: day, allowance_hours: Number($('holiday-allowance-days').value) * day, carry_hours: Number($('holiday-carry-days').value) * day, opening_taken_hours: Number($('holiday-opening-days').value) * day }, 'PUT');
+    openProfile(id); toast('Holiday allowance saved.');
+  }); };
+}
 function openDashboardSettings() {
   const current = S.data.dashboard || {};
   modal('Connect warehouse dashboard', `<p>Use the Render address of your existing Dylan Oaks dashboard. Colleague profiles show recorded Picking and Packing performance for the displayed rota week, with averages and departmental team comparisons.</p><label>Dashboard URL<input id="dashboard-url" type="url" value="${h(current.url || '')}" placeholder="https://your-dashboard.onrender.com" maxlength="200"></label><label>Integration key <span class="optional">${current.hasKey ? 'already saved - leave blank to keep it' : 'matches ROTA_API_KEY on the dashboard'}</span><input id="dashboard-key" type="password" autocomplete="new-password" maxlength="256"></label><p class="field-help">Install the employee history update on the dashboard to include all colleagues in future snapshots. Add the same integration key to that dashboard’s Render environment as ROTA_API_KEY. The key stays in the manager system. Each colleague’s name must match, or set their Dashboard name in their profile.</p>`, `${cancel}<button class="button primary" type="submit">Save connection</button>`);
@@ -535,14 +822,90 @@ function deletePerson(id) {
     });
   };
 }
+function profileAvailabilityHTML(p) {
+  const preferred = S.data.templates.find(t => t.id === p.preferred_template_id);
+  return `<section class="profile-availability"><div class="availability-heading"><h3>Weekly availability</h3><button type="button" class="button compact" id="profile-edit-availability">Edit availability</button></div>${p.availability ? `<dl class="availability-summary">${availabilityDays.map((name, index) => `<div><dt>${name.slice(0, 3)}</dt><dd>${h(availabilityDayText(p.availability, index))}</dd></div>`).join('')}</dl>` : '<p class="field-help">Availability not set. Add available days and times to fill the rota from this profile and check new shifts.</p>'}<p class="field-help">${h(p.default_warehouse || 'Warehouse not set')} · ${h(preferred ? `Preferred pattern: ${preferred.name}` : 'Fill using available times')} · Repeats every week</p></section>`;
+}
+function editAvailability(id) {
+  const p = S.data.people.find(person => person.id === id); if (!p) return;
+  modal(`Availability · ${p.name}`, `<p class="field-help">Set the days and times this colleague can work. These repeat each week. Overnight availability finishes the following day.</p><label class="check-label availability-enabled"><input id="availability-enabled" type="checkbox" ${p.availability ? 'checked' : ''}>Use weekly availability</label><div id="availability-days"><div class="availability-editor-head"><span>Day</span><span>Availability</span><span>From</span><span>Until</span></div>${availabilityDays.map((name, index) => { const day = p.availability?.days[index] || { mode: 'unavailable', start: '08:00', end: '16:30' }; return `<div class="availability-editor-row" data-availability-day="${index}"><strong>${name.slice(0, 3)}</strong><select id="availability-mode-${index}" aria-label="${name} availability">${[{ mode: 'unavailable', name: 'Unavailable' }, { mode: 'times', name: 'Available times' }, { mode: 'all_day', name: 'All day' }].map(option => `<option value="${option.mode}" ${option.mode === day.mode ? 'selected' : ''}>${option.name}</option>`).join('')}</select><input id="availability-start-${index}" aria-label="${name} available from" type="time" value="${h(day.start || '08:00')}"><input id="availability-end-${index}" aria-label="${name} available until" type="time" value="${h(day.end || '16:30')}"></div>`; }).join('')}<button type="button" class="text-button" id="availability-copy-weekdays">Copy Monday to Tuesday–Friday</button></div><p class="field-help availability-footnote">When switched off, availability is not checked and automatic filling skips this colleague. Saved shifts are kept; any conflicts are flagged in the manager rota.</p>`, '<button type="button" class="button" id="availability-back">Back to profile</button><button class="button primary" type="submit">Save availability</button>', true);
+  const refresh = () => {
+    const enabled = $('availability-enabled').checked;
+    for (let index = 0; index < 7; index++) {
+      const mode = $(`availability-mode-${index}`);
+      mode.disabled = !enabled;
+      for (const part of ['start', 'end']) { const input = $(`availability-${part}-${index}`); input.disabled = !enabled || mode.value !== 'times'; input.required = enabled && mode.value === 'times'; }
+    }
+    $('availability-copy-weekdays').disabled = !enabled;
+  };
+  $('availability-enabled').onchange = refresh;
+  $('availability-days').onchange = refresh;
+  $('availability-copy-weekdays').onclick = () => { for (let index = 1; index < 5; index++) for (const field of ['mode', 'start', 'end']) $(`availability-${field}-${index}`).value = $(`availability-${field}-0`).value; refresh(); };
+  $('availability-back').onclick = () => openProfile(id);
+  $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => {
+    const availability = normalizeAvailability($('availability-enabled').checked ? { days: availabilityDays.map((_, index) => ({ mode: $(`availability-mode-${index}`).value, start: $(`availability-start-${index}`).value, end: $(`availability-end-${index}`).value })) } : null);
+    await mutate(`/api/people/${id}/availability`, { availability }, 'PUT');
+    openProfile(id); toast('Weekly availability saved.');
+  }); };
+  refresh();
+}
+function openFillProfiles() {
+  const people = S.data.people.filter(p => p.active && p.location_id === S.locationId);
+  if (!people.length) { openTeam(); return; }
+  const selected = S.selected.size ? S.selected : new Set(people.map(p => p.id));
+  modal('Fill rota from profiles', `<p class="field-help">Create shifts for available days using each colleague’s department, warehouse and preferred pattern. Without a pattern, the available time window becomes the shift.</p><div class="assign-layout"><section><div class="section-label"><strong>Colleagues</strong><label class="check-label"><input id="fill-all" type="checkbox">Select all</label></div><input id="fill-search" type="search" placeholder="Find a colleague…" aria-label="Find colleagues to fill"><div class="people-checklist">${people.map(p => `<label class="person-check" data-name="${h(p.name.toLocaleLowerCase())}"><input type="checkbox" name="fill-people" value="${h(p.id)}" ${selected.has(p.id) ? 'checked' : ''}><span><strong>${h(p.name)}</strong><small>${h(departmentName(p))} · ${p.availability ? 'Availability saved' : 'Availability not set'}</small></span></label>`).join('')}</div></section><section><strong class="section-label">Days this week</strong><div class="days-checklist">${days.map((name, index) => `<label class="check-label"><input type="checkbox" name="fill-dates" value="${plusDays(S.week, index)}" checked><span>${name}</span><small>${shortDate(plusDays(S.week, index))}</small></label>`).join('')}</div></section></div><div class="field-row"><label>Shift pattern<select id="fill-pattern"><option value="">Profile pattern / available times</option>${S.data.templates.map(t => `<option value="${h(t.id)}">${h(t.name)} · ${h(t.start_time)}–${h(t.end_time)}</option>`).join('')}</select></label><label>Fallback warehouse<select id="fill-warehouse"><option value="">Use profile warehouse only</option>${choices(warehouses, S.warehouse)}</select></label></div><label>Unpaid break (mins) <span class="optional">for shifts made from available times</span><input id="fill-break" type="number" min="0" max="240" step="1" value="30" required></label><label class="check-label"><input id="fill-contract" type="checkbox" checked>Keep within contracted weekly hours where set</label><p class="field-help availability-footnote">Existing shifts, absences, unavailable days and patterns that do not fit are skipped. All-day availability needs a pattern. Your required-hours targets remain visible for planning.</p><button type="button" class="button" id="fill-preview-button">Preview shifts</button><div id="fill-preview" class="fill-preview" aria-live="polite"></div>`, `${cancel}<button type="submit" class="button primary" id="fill-save" disabled>Add shifts to draft</button>`, true);
+  let plan = null, previewSequence = 0;
+  const form = $('dialog-form');
+  const read = () => ({
+    location_id: S.locationId, week: S.week,
+    person_ids: [...form.querySelectorAll('[name="fill-people"]:checked')].map(input => input.value),
+    dates: [...form.querySelectorAll('[name="fill-dates"]:checked')].map(input => input.value),
+    template_id: $('fill-pattern').value, warehouse: $('fill-warehouse').value,
+    break_minutes: Number($('fill-break').value), respect_contract_hours: $('fill-contract').checked
+  });
+  const updateAll = () => { const inputs = [...form.querySelectorAll('.person-check:not([hidden]) input')]; $('fill-all').checked = inputs.length > 0 && inputs.every(input => input.checked); };
+  const invalidate = () => { previewSequence++; plan = null; $('fill-save').disabled = true; $('fill-preview').innerHTML = ''; updateAll(); };
+  form.addEventListener('change', invalidate); form.addEventListener('input', event => { if (event.target.id !== 'fill-search') invalidate(); });
+  $('fill-all').onchange = event => { for (const row of form.querySelectorAll('.person-check')) if (!row.hidden) row.querySelector('input').checked = event.target.checked; };
+  $('fill-search').oninput = event => { for (const row of form.querySelectorAll('.person-check')) row.hidden = !row.dataset.name.includes(event.target.value.toLocaleLowerCase()); updateAll(); };
+  $('fill-preview-button').onclick = async () => {
+    if (!form.reportValidity()) return;
+    const input = read(), sequence = ++previewSequence, preview = $('fill-preview');
+    if (!input.person_ids.length || !input.dates.length) { $('form-error').textContent = 'Choose colleagues and days.'; return; }
+    $('form-error').textContent = ''; plan = null; $('fill-save').disabled = true; $('fill-preview-button').disabled = true;
+    preview.innerHTML = '<p class="field-help">Checking profiles and existing shifts…</p>';
+    try {
+      const params = new URLSearchParams({ locationId: input.location_id, week: input.week, people: input.person_ids.join(','), dates: input.dates.join(','), template: input.template_id, warehouse: input.warehouse, breakMinutes: String(input.break_minutes), contractLimit: String(input.respect_contract_hours) });
+      const result = await api(`/api/weeks/availability-plan?${params}`);
+      if (sequence !== previewSequence || !preview.isConnected) return;
+      if (result.revision !== S.data.revision) {
+        await load();
+        if (sequence !== previewSequence || !preview.isConnected) return;
+        preview.innerHTML = '';
+        $('form-error').textContent = 'The rota changed in another window. The latest version is loaded; preview these shifts again.';
+        return;
+      }
+      plan = result;
+      preview.innerHTML = `<h3>${result.shifts.length} shift${result.shifts.length === 1 ? '' : 's'} · ${hours(result.total_minutes)}h</h3>${result.shifts.length ? `<div class="fill-shift-list">${result.shifts.map(shift => `<div><strong>${h(people.find(p => p.id === shift.person_id)?.name)}</strong><span>${shortDate(shift.date, { weekday: 'short' })} · ${h(shift.start_time)}–${h(shift.end_time)}${shift.end_time < shift.start_time ? ' +1' : ''}</span><small>${h(shift.department)} · ${h(shift.warehouse)} · ${shift.break_minutes}m unpaid break</small></div>`).join('')}</div>` : '<p class="field-help">No shifts can be added with these profiles and options.</p>'}${result.skipped.length ? `<details class="fill-skipped"><summary>${result.skipped.length} colleague days skipped — view reasons</summary><div class="fill-skipped-list">${result.skipped.map(row => `<p><strong>${h(row.name)}</strong> · ${shortDate(row.date, { weekday: 'short' })}<br>${h(row.reason)}</p>`).join('')}</div></details>` : ''}<p class="field-help">These shifts will be added to the private draft. Review the rota and publish when ready.</p>`;
+      $('fill-save').disabled = !result.shifts.length;
+    } catch (error) { if (sequence === previewSequence && preview.isConnected) { preview.innerHTML = ''; $('form-error').textContent = error.message; } }
+    finally { if ($('fill-preview-button') && preview.isConnected) $('fill-preview-button').disabled = false; }
+  };
+  form.onsubmit = event => { event.preventDefault(); if (!plan) return; formAction(form, async () => {
+    if (plan.revision !== S.data.revision) throw new Error('The rota changed. Preview these shifts again before adding them.');
+    const result = await mutate('/api/weeks/populate', read());
+    closeDialog(); S.selected.clear(); render(); toast(`${result.created} shifts added to the private draft. Review and publish when ready.`);
+  }); };
+  updateAll();
+}
 function editPerson(id) {
   const p = S.data.people.find(p => p.id === id) || { name: '', team: 'Warehouse', role: '', contract_minutes: 0, location_id: S.locationId, active: 1 };
-  modal(id ? 'Edit colleague' : 'Add colleague', `<label>Name<input id="person-name" value="${h(p.name)}" maxlength="120" required autocomplete="off"></label><div class="field-row"><label>Department <span class="optional">optional</span><select id="person-department"><option value="">Not set</option>${choices(departments, defaultDepartment(p))}</select></label><label>Role <span class="optional">optional</span><input id="person-role" value="${h(p.role)}" maxlength="80"></label></div><label>Dashboard name <span class="optional">optional - uses the colleague name if blank</span><input id="person-leaderboard-name" maxlength="120" value="${h(p.leaderboard_name || '')}" autocomplete="off"></label><div class="field-row"><label>Contracted hours / week<input id="person-hours" type="number" value="${p.contract_minutes / 60}" min="0" max="100" step="0.25" required></label><label>Home location<select id="person-location">${S.data.locations.map(l => `<option value="${h(l.id)}" ${l.id === p.location_id ? 'selected' : ''}>${h(l.name)}</option>`).join('')}</select></label></div><p class="field-help">This department is preselected for new shifts and can be changed per shift. Saved shifts keep their assigned department. Set hours to 0 for colleagues without fixed contracted hours.</p>${id ? `<label class="check-label"><input id="person-active" type="checkbox" ${p.active ? 'checked' : ''}>Active colleague</label>` : ''}`, `${id ? '<button type="button" class="button danger" id="delete-colleague">Delete colleague</button><span class="footer-spacer"></span>' : ''}<button type="button" class="button" id="back-team">Back</button><button class="button primary" type="submit">Save colleague</button>`);
+  modal(id ? 'Edit colleague' : 'Add colleague', `<label>Name<input id="person-name" value="${h(p.name)}" maxlength="120" required autocomplete="off"></label><div class="field-row"><label>Department <span class="optional">optional</span><select id="person-department"><option value="">Not set</option>${choices(departments, defaultDepartment(p))}</select></label><label>Role <span class="optional">optional</span><input id="person-role" value="${h(p.role)}" maxlength="80"></label></div><div class="field-row"><label>Warehouse <span class="optional">optional</span><select id="person-warehouse"><option value="">Not set</option>${choices(warehouses, p.default_warehouse || '')}</select></label><label>Preferred shift pattern <span class="optional">optional</span><select id="person-preferred-pattern"><option value="">Use available times</option>${S.data.templates.map(t => `<option value="${h(t.id)}" ${t.id === p.preferred_template_id ? 'selected' : ''}>${h(t.name)}</option>`).join('')}</select></label></div><label>Dashboard name <span class="optional">optional - uses the colleague name if blank</span><input id="person-leaderboard-name" maxlength="120" value="${h(p.leaderboard_name || '')}" autocomplete="off"></label><div class="field-row"><label>Contracted hours / week<input id="person-hours" type="number" value="${p.contract_minutes / 60}" min="0" max="100" step="0.25" required></label><label>Home location<select id="person-location">${S.data.locations.map(l => `<option value="${h(l.id)}" ${l.id === p.location_id ? 'selected' : ''}>${h(l.name)}</option>`).join('')}</select></label></div><p class="field-help">Department and warehouse are preselected for new shifts and can be changed per shift. The preferred pattern is used when filling from profiles. Add weekly availability from the colleague profile. Set hours to 0 for colleagues without fixed contracted hours.</p>${id ? `<label class="check-label"><input id="person-active" type="checkbox" ${p.active ? 'checked' : ''}>Active colleague</label>` : ''}`, `${id ? '<button type="button" class="button danger" id="delete-colleague">Delete colleague</button><span class="footer-spacer"></span>' : ''}<button type="button" class="button" id="back-team">Back</button><button class="button primary" type="submit">Save colleague</button>`);
   $('back-team').onclick = openTeam;
   if (id) $('delete-colleague').onclick = () => deletePerson(id);
   $('dialog-form').onsubmit = event => {
     event.preventDefault(); formAction(event.currentTarget, async () => {
-      await mutate(id ? `/api/people/${id}` : '/api/people', { name: $('person-name').value, default_department: $('person-department').value, role: $('person-role').value, leaderboard_name: $('person-leaderboard-name').value, is_example: false, contract_hours: Number($('person-hours').value), location_id: $('person-location').value, active: $('person-active') ? $('person-active').checked : true }, id ? 'PUT' : 'POST');
+      await mutate(id ? `/api/people/${id}` : '/api/people', { name: $('person-name').value, default_department: $('person-department').value, default_warehouse: $('person-warehouse').value, preferred_template_id: $('person-preferred-pattern').value || null, role: $('person-role').value, leaderboard_name: $('person-leaderboard-name').value, is_example: false, contract_hours: Number($('person-hours').value), location_id: $('person-location').value, active: $('person-active') ? $('person-active').checked : true }, id ? 'PUT' : 'POST');
       openTeam(); toast('Colleague saved.');
     });
   };
@@ -621,8 +984,8 @@ function openPublish() {
   if ($('unpublish-week')) $('unpublish-week').onclick = () => { if (confirm('Unpublish this week? Colleagues will no longer see it, and the draft will stay saved.')) formAction($('dialog-form'), async () => { await mutate('/api/publish', { location_id: S.locationId, week: S.week }, 'DELETE'); closeDialog(); toast('Week unpublished. The draft is private.'); }); };
 }
 function openCopy() {
-  modal('Copy last week', `<p>Copy shifts from <strong>${shortDate(plusDays(S.week, -7))} – ${shortDate(plusDays(S.week, -1))}</strong> into <strong>${shortDate(S.week)} – ${shortDate(plusDays(S.week, 6))}</strong> for ${h(currentLocation().name)}.</p><p class="field-help">Overlapping shifts and archived colleagues are skipped. Review the copied rota before publishing.</p>`, `${cancel}<button type="submit" class="button primary">Copy shifts</button>`);
-  $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { const r = await mutate('/api/weeks/copy', { location_id: S.locationId, week: S.week }); closeDialog(); toast(`${r.copied} shifts copied${r.skipped ? ` · ${r.skipped} skipped` : ''}.`); }); };
+  modal('Copy last week', `<p>Copy shifts from <strong>${shortDate(plusDays(S.week, -7))} – ${shortDate(plusDays(S.week, -1))}</strong> into <strong>${shortDate(S.week)} – ${shortDate(plusDays(S.week, 6))}</strong> for ${h(currentLocation().name)}.</p><p class="field-help">Overlapping shifts, shifts outside saved availability and archived colleagues are skipped. Review the copied rota before publishing.</p>`, `${cancel}<button type="submit" class="button primary">Copy shifts</button>`);
+  $('dialog-form').onsubmit = event => { event.preventDefault(); formAction(event.currentTarget, async () => { const r = await mutate('/api/weeks/copy', { location_id: S.locationId, week: S.week }); closeDialog(); toast(`${r.copied} shifts copied${r.skipped ? ` · ${r.skipped} skipped` : ''}${r.availability_skipped ? ` (${r.availability_skipped} outside availability)` : ''}.`); }); };
 }
 function openShare() {
   const loc = currentLocation(), url = `${location.origin}/rota/${loc.share_token}`;
@@ -647,7 +1010,7 @@ function downloadShiftReport() {
   downloadText(`rota-shift-report-${S.week}.json`, JSON.stringify(report, null, 2), 'application/json');
 }
 function openSettings() {
-  modal('Settings', `<div class="management-list"><button type="button" class="management-row" id="dashboard-settings"><span><strong>Dashboard connection</strong><small>Recorded employee performance in colleague profiles.</small></span><span class="edit-label">Connect</span></button><button type="button" class="management-row" id="manage-locations"><span><strong>Locations</strong><small>Add other sites for separate rotas.</small></span><span class="edit-label">Manage</span></button><button type="button" class="management-row" id="shift-display-report"><span><strong>Download shift display report</strong><small>Help diagnose shifts that are counted but missing from the rota.</small></span>${icon('download')}</button><a class="management-row" href="/api/backup"><span><strong>Download data backup</strong><small>Save a complete copy of colleagues, shifts and published rotas.</small></span>${icon('download')}</a></div><p class="field-help">Seven daily backups are also retained on the server. Scheduled hours use the entered start and finish times, less unpaid breaks.</p>`, '<button type="button" class="button" data-action="close-modal">Done</button>');
+  modal('Settings', `<div class="management-list"><button type="button" class="management-row" data-action="packing-stations"><span><strong>Packing stations</strong><small>Set up A/B positions separately for WH1 and WH2.</small></span><span class="edit-label">Manage</span></button><button type="button" class="management-row" id="dashboard-settings"><span><strong>Dashboard connection</strong><small>Recorded employee performance in colleague profiles.</small></span><span class="edit-label">Connect</span></button><button type="button" class="management-row" id="manage-locations"><span><strong>Locations</strong><small>Add other sites for separate rotas.</small></span><span class="edit-label">Manage</span></button><button type="button" class="management-row" id="shift-display-report"><span><strong>Download shift display report</strong><small>Help diagnose shifts that are counted but missing from the rota.</small></span>${icon('download')}</button><a class="management-row" href="/api/backup"><span><strong>Download data backup</strong><small>Save a complete copy of colleagues, shifts and published rotas.</small></span>${icon('download')}</a></div><p class="field-help">App version: <strong>${h(S.data.build || 'Unknown')}</strong>.</p><p class="field-help">Seven daily backups are also retained on the server. Scheduled hours use the entered start and finish times, less unpaid breaks.</p>`, '<button type="button" class="button" data-action="close-modal">Done</button>');
   $('manage-locations').onclick = openLocations; $('dashboard-settings').onclick = openDashboardSettings; $('shift-display-report').onclick = downloadShiftReport;
 }
 function openLocations() {
@@ -676,21 +1039,33 @@ document.addEventListener('dragstart', event => {
 });
 document.addEventListener('dragover', event => {
   if (!draggedShiftId || readOnly || S.loading || S.saving) return;
-  const target = event.target.closest('[data-drop-date]');
+  const target = event.target.closest('[data-packing-drop]') || event.target.closest('[data-drop-date]');
   if (dropElement !== target) { dropElement?.classList.remove('shift-drop-target'); dropElement = target; }
   if (target) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; target.classList.add('shift-drop-target'); }
 });
 document.addEventListener('drop', async event => {
-  const target = event.target.closest('[data-drop-date]');
+  const target = event.target.closest('[data-packing-drop]') || event.target.closest('[data-drop-date]');
   if (!draggedShiftId || !target || readOnly || S.loading || S.saving) return;
   event.preventDefault();
   const shift = S.data.shifts.find(s => s.id === draggedShiftId);
+  if (target.hasAttribute('data-packing-drop')) {
+    clearDrag(); ignoreShiftClickUntil = Date.now() + 400;
+    if (!shift) return;
+    const station = (S.data.packingStations || []).find(s => s.id === target.dataset.packingDrop);
+    try {
+      if (!isPackingShift(shift)) throw new Error('Only Packing work or training shifts can use these positions.');
+      if (shift.date !== target.dataset.date) throw new Error('Assign a position on the shift’s own day.');
+      await assignPackingPosition(shift, station, station ? target.dataset.packingPosition : '', target.dataset.date);
+    } catch (error) { toast(error.message, true); }
+    return;
+  }
   const personId = target.dataset.dropPerson || shift?.person_id, date = target.dataset.dropDate;
   clearDrag(); ignoreShiftClickUntil = Date.now() + 400;
   if (!shift || shift.person_id === personId && shift.date === date) return;
   const scroll = document.querySelector('.rota-scroll'), top = scroll?.scrollTop || 0, left = scroll?.scrollLeft || 0;
   try {
-    await mutate(`/api/shifts/${shift.id}`, { ...shift, person_id: personId, date, location_id: S.locationId }, 'PUT');
+    const result = await saveWithAvailability(`/api/shifts/${shift.id}`, { ...shift, person_id: personId, date, location_id: S.locationId }, 'PUT');
+    if (!result) return;
     const next = document.querySelector('.rota-scroll'); if (next) { next.scrollTop = top; next.scrollLeft = left; }
     toast(`Shift moved to ${shortDate(date, { weekday: 'short' })}. Publish the week when ready.`);
   } catch (error) { toast(error.message, true); }
@@ -713,7 +1088,13 @@ document.addEventListener('click', async event => {
     if (action === 'print') return window.print();
     if (action === 'pdf') return openPDF();
     if (readOnly) return;
+    if (action === 'packing-stations') return openPackingStations();
+    if (action === 'packing-choose') return openPackingChoice(button.dataset.station, button.dataset.position, button.dataset.date);
+    if (action === 'packing-unassign') { await assignPackingPosition(S.data.shifts.find(s => s.id === button.dataset.id), null); return; }
     if (action === 'day-hours') return openDayHours(button.dataset.date);
+    if (action === 'copy-day') return openCopyDay(button.dataset.date);
+    if (action === 'day-status') return openDayStatus(button.dataset.status, button.dataset.date);
+    if (action === 'arrival') return openArrival(button.dataset.person, button.dataset.date);
     if (action === 'clear-week') return openClearRota('week');
     if (action === 'clear-day') return openClearRota('day', button.dataset.date);
     if (action === 'attendance') {
@@ -727,6 +1108,7 @@ document.addEventListener('click', async event => {
     if (action === 'patterns') return openPatterns();
     if (action === 'settings') return openSettings();
     if (action === 'assign') return openAssign();
+    if (action === 'fill-profiles') return openFillProfiles();
     if (action === 'add-cell') return openAssign({ personIds: [button.dataset.person], dates: [button.dataset.date] });
     if (action === 'edit-shift') return openAssign({ shift: [...S.data.shifts, ...(S.data.previousShifts || [])].find(s => s.id === button.dataset.id) });
     if (action === 'publish') return openPublish();
